@@ -211,4 +211,4 @@ output/
 experiment_outputs/
 
 # Wandb artifacts cache (downloaded evaluation data)
-artifacts/%
+artifacts/

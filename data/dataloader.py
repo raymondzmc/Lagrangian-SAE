@@ -1,5 +1,7 @@
 from typing import Any
 import math
+import time
+import random
 
 import einops
 import numpy as np
@@ -11,6 +13,50 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from data.config import DataConfig
+
+
+def load_dataset_with_retry(
+    dataset_name: str,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    **kwargs
+) -> Dataset | IterableDataset:
+    """Load a HuggingFace dataset with exponential backoff retry.
+    
+    Args:
+        dataset_name: Name of the dataset to load
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds before first retry
+        max_delay: Maximum delay in seconds between retries
+        **kwargs: Additional arguments to pass to load_dataset
+        
+    Returns:
+        The loaded dataset
+        
+    Raises:
+        Exception: If all retry attempts fail
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            return load_dataset(dataset_name, **kwargs)
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries:
+                # Exponential backoff with jitter
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                jitter = random.uniform(0, delay * 0.1)  # Add 10% jitter
+                total_delay = delay + jitter
+                
+                print(f"Dataset loading failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                print(f"Retrying in {total_delay:.1f}s...")
+                time.sleep(total_delay)
+            else:
+                print(f"Dataset loading failed after {max_retries + 1} attempts")
+    
+    raise last_exception
 
 
 def create_eval_dataset_with_progress(dataset: IterableDataset, n_train_samples: int, n_eval_samples: int) -> IterableDataset:
@@ -194,8 +240,12 @@ def create_dataloaders(
     """
     # Use mini_batch_size if provided, otherwise use train_batch_size
     actual_train_batch_size = mini_batch_size if mini_batch_size is not None else data_config.train_batch_size
-    # Load and prepare dataset
-    dataset = load_dataset(data_config.dataset_name, streaming=data_config.streaming, split=data_config.split)
+    # Load and prepare dataset with exponential retry for robustness
+    dataset = load_dataset_with_retry(
+        data_config.dataset_name,
+        streaming=data_config.streaming,
+        split=data_config.split
+    )
     seed = data_config.seed if data_config.seed is not None else global_seed
     
     # Create train and eval splits

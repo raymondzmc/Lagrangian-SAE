@@ -1,7 +1,7 @@
 datasets==4.4.1
 dotenv==0.9.9
 jaxtyping==0.3.3
-torch==2.9.0
+# torch==2.9.0
 transformer-lens==2.16.1
 transformers==4.57.3
 wandb==0.21.2

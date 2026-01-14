@@ -13,6 +13,7 @@ Key design choices:
 - Uses per-feature learned thresholds (like JumpReLU) for flexible sparsity control
 - Uses differentiable L0 approximation for gradient computation
 """
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -76,7 +77,9 @@ class LagrangianSAEConfig(SAEConfig):
     
     # Bidirectional L0 constraint parameters (prevents L0 from going too far below target)
     l0_undershoot_margin: float = Field(0.1, description="Margin below target before applying undershoot penalty (fraction of target_l0)")
-    beta_undershoot: float = Field(0.1, description="Coefficient for L0 undershoot penalty (when L0 < target - margin)")
+    beta_undershoot: float = Field(1.0, description="Coefficient for L0 undershoot penalty (when L0 < target - margin)")
+    rho_undershoot: float = Field(1.0, description="Quadratic penalty coefficient for L0 undershoot (stronger gradient when far below target)")
+    threshold_decay_on_undershoot: float = Field(0.999, description="Threshold decay factor when L0 < target - margin (direct control, applied per step)")
 
     @model_validator(mode="before")
     @classmethod
@@ -133,7 +136,9 @@ class LagrangianSAE(BaseSAE):
         alpha_max: float = 100.0,
         rho_quadratic: float = 0.1,
         l0_undershoot_margin: float = 0.1,
-        beta_undershoot: float = 0.1,
+        beta_undershoot: float = 1.0,
+        rho_undershoot: float = 1.0,
+        threshold_decay_on_undershoot: float = 0.999,
         l0_ema_momentum: float = 0.99,
         initial_threshold: float = 0.5,
         bandwidth: float = 0.1,
@@ -161,6 +166,8 @@ class LagrangianSAE(BaseSAE):
             rho_quadratic: Coefficient for quadratic penalty in augmented Lagrangian.
             l0_undershoot_margin: Margin below target before applying undershoot penalty (fraction of target_l0).
             beta_undershoot: Coefficient for L0 undershoot penalty (when L0 < target - margin).
+            rho_undershoot: Quadratic penalty coefficient for L0 undershoot (stronger gradient when far below target).
+            threshold_decay_on_undershoot: Threshold decay factor when L0 < target - margin (direct control).
             l0_ema_momentum: Momentum for running mean of L0 (0.99 = smooth, 0.0 = no smoothing).
             initial_threshold: Initial per-feature threshold value (fallback if calibration disabled).
             bandwidth: Bandwidth for step function gradient approximation.
@@ -193,6 +200,8 @@ class LagrangianSAE(BaseSAE):
         self.rho_quadratic = rho_quadratic
         self.l0_undershoot_margin = l0_undershoot_margin
         self.beta_undershoot = beta_undershoot
+        self.rho_undershoot = rho_undershoot
+        self.threshold_decay_on_undershoot = threshold_decay_on_undershoot
         self.l0_ema_momentum = l0_ema_momentum
         self.bandwidth = bandwidth
         self.use_pre_enc_bias = use_pre_enc_bias
@@ -493,9 +502,11 @@ class LagrangianSAE(BaseSAE):
         undershoot_threshold = self.target_l0 * (1.0 - self.l0_undershoot_margin)
         undershoot_violation = F.relu(undershoot_threshold - mean_l0_diff)  # Positive when L0 too low
         normalized_undershoot_violation = undershoot_violation / self.target_l0
+        # Linear + quadratic undershoot penalty for stronger gradient when far below target
         undershoot_penalty = self.beta_undershoot * normalized_undershoot_violation
+        quadratic_undershoot = self.rho_undershoot * (normalized_undershoot_violation ** 2)
         
-        total_loss = self.mse_coeff * mse_loss + sparsity_loss + quadratic_penalty + undershoot_penalty
+        total_loss = self.mse_coeff * mse_loss + sparsity_loss + quadratic_penalty + undershoot_penalty + quadratic_undershoot
 
         # Compute number of dead features for logging
         num_dead_features = torch.tensor(0.0, device=output.input.device)
@@ -510,7 +521,8 @@ class LagrangianSAE(BaseSAE):
             "running_l0": self.running_l0.detach().clone(),  # Running mean L0 (expected L0)
             "alpha": alpha_value,
             "quadratic_penalty": quadratic_penalty.detach().clone(),
-            "undershoot_penalty": undershoot_penalty.detach().clone(),  # Penalty for L0 going too low
+            "undershoot_penalty": undershoot_penalty.detach().clone(),  # Linear penalty for L0 going too low
+            "quadratic_undershoot": quadratic_undershoot.detach().clone(),  # Quadratic penalty for L0 going too low
             "mean_threshold": mean_threshold.detach().clone(),  # Track learned thresholds
         }
 
@@ -558,6 +570,31 @@ class LagrangianSAE(BaseSAE):
                 self.alpha.add_(self.alpha_lr_down * self._last_constraint_violation)
             # Clamp alpha to valid range AFTER update
             self.alpha.clamp_(min=0.0, max=self.alpha_max)
+
+    @torch.no_grad()
+    def maybe_decay_thresholds(self) -> None:
+        """
+        Decay thresholds when L0 is below the undershoot threshold.
+        
+        This provides direct, non-gradient control to push L0 back toward target.
+        Should be called after optimizer.step() and update_alpha().
+        
+        When running_l0 < target * (1 - margin):
+            threshold_new = threshold_old * decay_factor
+            log_threshold_new = log_threshold_old + log(decay_factor)
+            
+        Lower thresholds → more features activate → higher L0
+        
+        This is a backup mechanism when gradient-based penalties are insufficient
+        due to the sparse gradient flow through the StepFunction.
+        """
+        undershoot_threshold = self.target_l0 * (1.0 - self.l0_undershoot_margin)
+        if self.running_l0 < undershoot_threshold:
+            # Decay thresholds to allow more features to activate
+            # threshold_new = threshold_old * decay_factor
+            # In log space: log_threshold_new = log_threshold_old + log(decay_factor)
+            # log(0.999) ≈ -0.001, so this decreases log_threshold
+            self.jumprelu.log_threshold.data.add_(math.log(self.threshold_decay_on_undershoot))
 
     @property
     def dict_elements(self) -> torch.Tensor:

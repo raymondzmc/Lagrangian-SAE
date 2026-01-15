@@ -3,17 +3,17 @@
 Lagrangian Sparse Autoencoder using dual ascent to learn sparsity.
 
 This SAE uses a Lagrangian multiplier (alpha) to adaptively control the sparsity penalty,
-targeting a maximum L0 sparsity level. Unlike TopK/BatchTopK which enforce exact
+targeting an L0 sparsity level. Unlike TopK/BatchTopK which enforce exact
 sparsity, this approach learns to achieve a target sparsity through optimization.
 
 Key design choices:
-- Only penalizes when L0 > target_l0 (inequality constraint: L0 ≤ target)
-- When L0 < target, focus purely on reconstruction (which naturally increases L0)
+- Equality constraint: penalizes when L0 ≠ target_l0 (both directions)
+- When L0 < target: negative alpha incentivizes more active features
+- When L0 > target: positive alpha penalizes excess features
 - Uses running mean (EMA) of L0 for stable constraint evaluation
 - Uses per-feature learned thresholds (like JumpReLU) for flexible sparsity control
 - Uses differentiable L0 approximation for gradient computation
 """
-import math
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -39,16 +39,17 @@ class LagrangianSAEConfig(SAEConfig):
     Notes:
     - Uses JumpReLU activation with per-feature learned thresholds
     - Differentiable L0 approximation for gradient computation  
-    - Dual ascent on alpha to maintain L0 ≤ target_l0
-    - Only penalizes when L0 > target (reconstruction-only when L0 < target)
+    - Dual ascent on alpha to achieve L0 ≈ target_l0 (equality constraint)
+    - Penalizes when L0 ≠ target (bidirectional: both above and below)
+    - Alpha can be positive (penalize high L0) or negative (incentivize high L0)
     - Uses running mean (EMA) of L0 for stable constraint evaluation
     - Comparable to TopK/BatchTopK for analyzing global expected L0
     """
     sae_type: SAEType = Field(default=SAEType.LAGRANGIAN, description="Type of SAE (automatically set to lagrangian)")
-    target_l0: float = Field(..., description="Target maximum L0 sparsity (number of active features per sample)")
-    initial_alpha: float = Field(0.0, description="Initial alpha for Lagrangian multiplier (>= 0)")
-    alpha_lr: float = Field(1e-2, description="Learning rate for alpha dual ascent (when L0 > target)")
-    alpha_lr_down: float | None = Field(None, description="Learning rate for alpha descent (when L0 < target). If None, uses 0.1 * alpha_lr for slower descent to prevent L0 undershoot.")
+    target_l0: float = Field(..., description="Target L0 sparsity (number of active features per sample)")
+    initial_alpha: float = Field(0.0, description="Initial alpha for Lagrangian multiplier (can be positive or negative)")
+    alpha_lr: float = Field(1e-2, description="Learning rate for alpha dual ascent")
+    alpha_lr_down: float | None = Field(None, description="Unused for equality constraint (kept for backward compatibility)")
     alpha_max: float = Field(100.0, description="Maximum value for alpha to prevent instability")
     tied_encoder_init: bool = Field(True, description="Initialize encoder as decoder.T")
     use_pre_enc_bias: bool = Field(False, description="Subtract decoder bias before encoding")
@@ -74,12 +75,6 @@ class LagrangianSAEConfig(SAEConfig):
     
     # Quadratic penalty coefficient for constraint violation (augmented Lagrangian)
     rho_quadratic: float = Field(0.1, description="Coefficient for quadratic penalty term in augmented Lagrangian")
-    
-    # Bidirectional L0 constraint parameters (prevents L0 from going too far below target)
-    l0_undershoot_margin: float = Field(0.1, description="Margin below target before applying undershoot penalty (fraction of target_l0)")
-    beta_undershoot: float = Field(1.0, description="Coefficient for L0 undershoot penalty (when L0 < target - margin)")
-    rho_undershoot: float = Field(1.0, description="Quadratic penalty coefficient for L0 undershoot (stronger gradient when far below target)")
-    threshold_decay_on_undershoot: float = Field(0.999, description="Threshold decay factor when L0 < target - margin (direct control, applied per step)")
 
     @model_validator(mode="before")
     @classmethod
@@ -107,19 +102,19 @@ class LagrangianSAE(BaseSAE):
       - Linear encoder/decoder with bias
       - JumpReLU activation with per-feature learned thresholds
       - Differentiable L0 approximation for gradient computation
-      - Dual ascent on alpha to achieve L0 ≤ target_l0
+      - Dual ascent on alpha to achieve L0 ≈ target_l0 (equality constraint)
       - MSE reconstruction loss
       
     The optimization problem is:
         min_θ E[MSE(x, x̂)]
-        s.t. E[L0(c)] ≤ target_l0
+        s.t. E[L0(c)] = target_l0
         
-    We use augmented Lagrangian with dual ascent (inequality constraint):
-        L = MSE + α · max(0, L0_diff - target) + ρ/2 · max(0, L0 - target)²
-        α ← max(0, α + α_lr · (L0 - target_l0))
+    We use augmented Lagrangian with dual ascent (equality constraint):
+        L = MSE + α · (L0_diff - target) + ρ/2 · (L0 - target)²
+        α ← α + α_lr · (L0 - target_l0)
         
-    When L0 < target, only MSE is optimized, allowing reconstruction to naturally
-    increase L0 toward the target.
+    When L0 < target: α becomes negative, incentivizing more active features.
+    When L0 > target: α becomes positive, penalizing excess features.
     
     Unlike fixed-threshold approaches, this SAE learns per-feature thresholds,
     allowing each dictionary element to find its optimal activation threshold.
@@ -135,10 +130,6 @@ class LagrangianSAE(BaseSAE):
         alpha_lr_down: float | None = None,
         alpha_max: float = 100.0,
         rho_quadratic: float = 0.1,
-        l0_undershoot_margin: float = 0.1,
-        beta_undershoot: float = 1.0,
-        rho_undershoot: float = 1.0,
-        threshold_decay_on_undershoot: float = 0.999,
         l0_ema_momentum: float = 0.99,
         initial_threshold: float = 0.5,
         bandwidth: float = 0.1,
@@ -157,17 +148,12 @@ class LagrangianSAE(BaseSAE):
         Args:
             input_size: Dimensionality of inputs (e.g., residual stream width).
             n_dict_components: Number of dictionary features (latent size).
-            target_l0: Target maximum number of active features per sample.
-            initial_alpha: Initial value for Lagrangian multiplier (>= 0).
-            alpha_lr: Learning rate for alpha dual ascent (when L0 > target).
-            alpha_lr_down: Learning rate for alpha descent (when L0 < target). 
-                          If None, uses 0.1 * alpha_lr for slower descent.
-            alpha_max: Maximum value for alpha.
+            target_l0: Target number of active features per sample.
+            initial_alpha: Initial value for Lagrangian multiplier (can be positive or negative).
+            alpha_lr: Learning rate for alpha dual ascent.
+            alpha_lr_down: Unused for equality constraint (kept for backward compatibility).
+            alpha_max: Maximum absolute value for alpha (clamped to [-alpha_max, alpha_max]).
             rho_quadratic: Coefficient for quadratic penalty in augmented Lagrangian.
-            l0_undershoot_margin: Margin below target before applying undershoot penalty (fraction of target_l0).
-            beta_undershoot: Coefficient for L0 undershoot penalty (when L0 < target - margin).
-            rho_undershoot: Quadratic penalty coefficient for L0 undershoot (stronger gradient when far below target).
-            threshold_decay_on_undershoot: Threshold decay factor when L0 < target - margin (direct control).
             l0_ema_momentum: Momentum for running mean of L0 (0.99 = smooth, 0.0 = no smoothing).
             initial_threshold: Initial per-feature threshold value (fallback if calibration disabled).
             bandwidth: Bandwidth for step function gradient approximation.
@@ -187,7 +173,7 @@ class LagrangianSAE(BaseSAE):
         assert n_dict_components > 0 and input_size > 0
         assert bandwidth > 0, "bandwidth must be positive"
         assert 0.0 <= l0_ema_momentum < 1.0, "l0_ema_momentum must be in [0, 1)"
-        assert initial_alpha >= 0, "initial_alpha must be non-negative"
+        # initial_alpha can be positive or negative for equality constraint
         assert initial_threshold > 0, "initial_threshold must be positive"
 
         self.input_size = input_size
@@ -198,10 +184,6 @@ class LagrangianSAE(BaseSAE):
         self.alpha_lr_down = alpha_lr_down if alpha_lr_down is not None else 0.1 * alpha_lr
         self.alpha_max = alpha_max
         self.rho_quadratic = rho_quadratic
-        self.l0_undershoot_margin = l0_undershoot_margin
-        self.beta_undershoot = beta_undershoot
-        self.rho_undershoot = rho_undershoot
-        self.threshold_decay_on_undershoot = threshold_decay_on_undershoot
         self.l0_ema_momentum = l0_ema_momentum
         self.bandwidth = bandwidth
         self.use_pre_enc_bias = use_pre_enc_bias
@@ -218,8 +200,8 @@ class LagrangianSAE(BaseSAE):
         self.aux_coeff = (aux_coeff if aux_coeff is not None else 0.0) if self.aux_k > 0 else 0.0
 
         # Lagrangian multiplier (alpha) as a buffer (not a parameter - updated via dual ascent)
-        # Alpha >= 0 always (inequality constraint)
-        self.register_buffer("alpha", torch.tensor(max(0.0, initial_alpha), dtype=torch.float32))
+        # Alpha can be positive or negative for equality constraint
+        self.register_buffer("alpha", torch.tensor(initial_alpha, dtype=torch.float32))
         
         # Running mean of L0 for stable constraint evaluation (EMA)
         # Initialize to target_l0 so the constraint starts satisfied
@@ -440,14 +422,11 @@ class LagrangianSAE(BaseSAE):
         """
         Computes the augmented Lagrangian loss for sparsity control.
         
-        Bidirectional constraint (target - margin ≤ L0 ≤ target):
-            Loss = MSE 
-                 + α * max(0, L0_diff - target) + ρ/2 * max(0, L0_diff - target)²  [overshoot]
-                 + β * max(0, (target - margin) - L0_diff)                          [undershoot]
+        Equality constraint (L0 ≈ target):
+            Loss = MSE + α * (L0_diff - target) + ρ/2 * (L0_diff - target)²
             
-        When L0 > target: Sparsity penalty is applied to reduce L0.
-        When target - margin ≤ L0 ≤ target: No penalty (optimal zone).
-        When L0 < target - margin: Undershoot penalty pushes L0 back up.
+        When L0 < target: Negative penalty incentivizes more active features.
+        When L0 > target: Positive penalty penalizes excess features.
         
         Uses:
         - L0_diff: Differentiable L0 approximation (provides gradient to learned thresholds)
@@ -462,7 +441,6 @@ class LagrangianSAE(BaseSAE):
         
         # Compute mean L0 across the batch (true L0 for monitoring)
         mean_l0 = output.l0.mean()
-        batch_constraint_violation = mean_l0 - self.target_l0
         
         # Update running L0 (EMA) for stable constraint evaluation
         if self.training:
@@ -476,7 +454,6 @@ class LagrangianSAE(BaseSAE):
         running_constraint_violation = self.running_l0 - self.target_l0
         
         # Store RAW constraint violation for dual ascent (can be negative)
-        # The clamp to >= 0 happens in update_alpha() AFTER the update
         self._last_constraint_violation = running_constraint_violation.detach().clone()
         
         # Differentiable L0 for gradient computation
@@ -486,32 +463,16 @@ class LagrangianSAE(BaseSAE):
         # Get current alpha value (detached to avoid gradient through alpha)
         alpha_value = self.alpha.detach().clone()
         
-        # Inequality constraint: only penalize when L0 > target
-        # Use ReLU to get max(0, L0_diff - target)
-        positive_violation = F.relu(differentiable_violation)
-        normalized_positive_violation = positive_violation / self.target_l0
+        # Equality constraint: penalize both directions (no ReLU)
+        # Normalized violation for stable gradient magnitudes
+        normalized_violation = differentiable_violation / self.target_l0
         
-        # Augmented Lagrangian formulation:
-        # L = MSE + α * max(0, L0_diff - target) + ρ/2 * max(0, L0_diff - target)²
-        # No normalization - alpha directly controls penalty strength
-        sparsity_loss = alpha_value * normalized_positive_violation
-        quadratic_penalty = self.rho_quadratic * (normalized_positive_violation ** 2)
+        # Augmented Lagrangian formulation for equality constraint:
+        # L = MSE + α * (L0_diff - target) + ρ/2 * (L0_diff - target)²
+        sparsity_loss = alpha_value * normalized_violation
+        quadratic_penalty = self.rho_quadratic * (normalized_violation ** 2)
         
-        # Bidirectional constraint: penalize when L0 goes too far below target
-        # This prevents L0 from drifting below target when alpha=0
-        undershoot_threshold = self.target_l0 * (1.0 - self.l0_undershoot_margin)
-        undershoot_violation = F.relu(undershoot_threshold - mean_l0_diff)  # Positive when L0 too low
-        normalized_undershoot_violation = undershoot_violation / self.target_l0
-        # Linear + quadratic undershoot penalty for stronger gradient when far below target
-        undershoot_penalty = self.beta_undershoot * normalized_undershoot_violation
-        quadratic_undershoot = self.rho_undershoot * (normalized_undershoot_violation ** 2)
-        
-        total_loss = self.mse_coeff * mse_loss + sparsity_loss + quadratic_penalty + undershoot_penalty + quadratic_undershoot
-
-        # Compute number of dead features for logging
-        num_dead_features = torch.tensor(0.0, device=output.input.device)
-        if self.dead_toks_threshold is not None:
-            num_dead_features = (self.stats_last_nonzero > self.dead_toks_threshold).sum().float()
+        total_loss = self.mse_coeff * mse_loss + sparsity_loss + quadratic_penalty
 
         # Compute mean threshold for logging
         mean_threshold = self.jumprelu.threshold.mean()
@@ -521,8 +482,6 @@ class LagrangianSAE(BaseSAE):
             "running_l0": self.running_l0.detach().clone(),  # Running mean L0 (expected L0)
             "alpha": alpha_value,
             "quadratic_penalty": quadratic_penalty.detach().clone(),
-            "undershoot_penalty": undershoot_penalty.detach().clone(),  # Linear penalty for L0 going too low
-            "quadratic_undershoot": quadratic_undershoot.detach().clone(),  # Quadratic penalty for L0 going too low
             "mean_threshold": mean_threshold.detach().clone(),  # Track learned thresholds
         }
 
@@ -547,54 +506,25 @@ class LagrangianSAE(BaseSAE):
     @torch.no_grad()
     def update_alpha(self) -> None:
         """
-        Perform dual ascent update on alpha for inequality constraint.
+        Perform dual ascent update on alpha for equality constraint.
         
         Should be called after optimizer.step() to avoid autograd conflicts.
         
-        Uses ASYMMETRIC learning rates to prevent L0 undershoot:
-        - When L0 > target: α increases with alpha_lr (fast response to overshoot)
-        - When L0 < target: α decreases with alpha_lr_down (slow descent to prevent undershoot)
+        Uses symmetric learning rate for equality constraint:
+        - When L0 > target: α increases (positive violation)
+        - When L0 < target: α decreases (negative violation)
         
-        This prevents the scenario where alpha drops to 0 too quickly, causing
-        L0 to drift far below target due to MSE-only optimization.
+        Alpha can be positive or negative for equality constraints:
+        - Positive α: penalizes high L0 (pushes L0 down)
+        - Negative α: incentivizes high L0 (pushes L0 up)
         
-        Alpha is clamped to [0, alpha_max] after update.
+        Alpha is clamped to [-alpha_max, alpha_max] after update.
         """
         if hasattr(self, '_last_constraint_violation'):
-            # Use asymmetric learning rates
-            if self._last_constraint_violation > 0:
-                # L0 > target: increase penalty with fast learning rate
-                self.alpha.add_(self.alpha_lr * self._last_constraint_violation)
-            else:
-                # L0 < target: decrease penalty with slower learning rate
-                self.alpha.add_(self.alpha_lr_down * self._last_constraint_violation)
-            # Clamp alpha to valid range AFTER update
-            self.alpha.clamp_(min=0.0, max=self.alpha_max)
-
-    @torch.no_grad()
-    def maybe_decay_thresholds(self) -> None:
-        """
-        Decay thresholds when L0 is below the undershoot threshold.
-        
-        This provides direct, non-gradient control to push L0 back toward target.
-        Should be called after optimizer.step() and update_alpha().
-        
-        When running_l0 < target * (1 - margin):
-            threshold_new = threshold_old * decay_factor
-            log_threshold_new = log_threshold_old + log(decay_factor)
-            
-        Lower thresholds → more features activate → higher L0
-        
-        This is a backup mechanism when gradient-based penalties are insufficient
-        due to the sparse gradient flow through the StepFunction.
-        """
-        undershoot_threshold = self.target_l0 * (1.0 - self.l0_undershoot_margin)
-        if self.running_l0 < undershoot_threshold:
-            # Decay thresholds to allow more features to activate
-            # threshold_new = threshold_old * decay_factor
-            # In log space: log_threshold_new = log_threshold_old + log(decay_factor)
-            # log(0.999) ≈ -0.001, so this decreases log_threshold
-            self.jumprelu.log_threshold.data.add_(math.log(self.threshold_decay_on_undershoot))
+            # Symmetric update for equality constraint
+            self.alpha.add_(self.alpha_lr * self._last_constraint_violation)
+            # Alpha can be negative for equality constraint
+            self.alpha.clamp_(min=-self.alpha_max, max=self.alpha_max)
 
     @property
     def dict_elements(self) -> torch.Tensor:

@@ -209,9 +209,6 @@ def train(
                 # Perform dual ascent update for LagrangianSAE
                 if hasattr(module, 'update_alpha'):
                     module.update_alpha()
-                # Decay thresholds when L0 is too low (direct control for undershoot)
-                if hasattr(module, 'maybe_decay_thresholds'):
-                    module.maybe_decay_thresholds()
 
         progress_ratio += 1.0 / len(train_loader)
         if is_log_step:

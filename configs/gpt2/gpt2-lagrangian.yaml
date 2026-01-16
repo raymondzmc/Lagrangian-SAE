@@ -64,10 +64,10 @@ saes:
   bandwidth: 0.1  # Bandwidth for gradient approximation (larger = more gradient signal to thresholds)
   # Threshold calibration (RECOMMENDED: auto-sets thresholds so initial L0 ≈ target_l0)
   calibrate_thresholds: true
+  # Constraint type: true = equality (L0 ≈ target), false = inequality (L0 ≤ target)
+  equality_constraint: true
   tied_encoder_init: true
   use_pre_enc_bias: true
-  # Input normalization (RECOMMENDED: ensures consistent L0 behavior across all layers)
-  # Without this, later layers (6, 8, 10) may have much larger activations and fail to reach target L0
   normalize_input: true
   # Dead feature tracking and auxiliary loss
   dead_toks_threshold: 10_000_000

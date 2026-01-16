@@ -7,9 +7,11 @@ targeting an L0 sparsity level. Unlike TopK/BatchTopK which enforce exact
 sparsity, this approach learns to achieve a target sparsity through optimization.
 
 Key design choices:
-- Equality constraint: penalizes when L0 ≠ target_l0 (both directions)
-- When L0 < target: negative alpha incentivizes more active features
-- When L0 > target: positive alpha penalizes excess features
+- Supports two constraint types via `equality_constraint` option:
+  - Equality (default, equality_constraint=True): penalizes when L0 ≠ target_l0 (both directions)
+  - Inequality (equality_constraint=False): penalizes only when L0 > target_l0 (single direction)
+- Equality mode: alpha can be negative (incentivizes more features when L0 < target)
+- Inequality mode: alpha is non-negative (only penalizes excess features)
 - Uses running mean (EMA) of L0 for stable constraint evaluation
 - Uses per-feature learned thresholds (like JumpReLU) for flexible sparsity control
 - Uses differentiable L0 approximation for gradient computation
@@ -39,9 +41,10 @@ class LagrangianSAEConfig(SAEConfig):
     Notes:
     - Uses JumpReLU activation with per-feature learned thresholds
     - Differentiable L0 approximation for gradient computation  
-    - Dual ascent on alpha to achieve L0 ≈ target_l0 (equality constraint)
-    - Penalizes when L0 ≠ target (bidirectional: both above and below)
-    - Alpha can be positive (penalize high L0) or negative (incentivize high L0)
+    - Dual ascent on alpha to achieve target sparsity
+    - Supports two constraint modes via `equality_constraint`:
+      - True (default): Equality constraint (L0 ≈ target_l0), alpha in [-max, max]
+      - False: Inequality constraint (L0 ≤ target_l0), alpha in [0, max]
     - Uses running mean (EMA) of L0 for stable constraint evaluation
     - Comparable to TopK/BatchTopK for analyzing global expected L0
     """
@@ -75,6 +78,9 @@ class LagrangianSAEConfig(SAEConfig):
     
     # Quadratic penalty coefficient for constraint violation (augmented Lagrangian)
     rho_quadratic: float = Field(0.1, description="Coefficient for quadratic penalty term in augmented Lagrangian")
+    
+    # Constraint type: equality (L0 ≈ target) vs inequality (L0 ≤ target)
+    equality_constraint: bool = Field(True, description="If True, enforce L0 ≈ target (equality); if False, enforce L0 <= target (inequality)")
 
     @model_validator(mode="before")
     @classmethod
@@ -102,19 +108,20 @@ class LagrangianSAE(BaseSAE):
       - Linear encoder/decoder with bias
       - JumpReLU activation with per-feature learned thresholds
       - Differentiable L0 approximation for gradient computation
-      - Dual ascent on alpha to achieve L0 ≈ target_l0 (equality constraint)
+      - Dual ascent on alpha to achieve target sparsity
       - MSE reconstruction loss
       
-    The optimization problem is:
-        min_θ E[MSE(x, x̂)]
-        s.t. E[L0(c)] = target_l0
-        
-    We use augmented Lagrangian with dual ascent (equality constraint):
+    Supports two constraint modes via `equality_constraint`:
+    
+    Equality constraint (equality_constraint=True, default):
+        min_θ E[MSE(x, x̂)]  s.t. E[L0(c)] = target_l0
         L = MSE + α · (L0_diff - target) + ρ/2 · (L0 - target)²
-        α ← α + α_lr · (L0 - target_l0)
+        α ← α + α_lr · (L0 - target_l0), α ∈ [-α_max, α_max]
         
-    When L0 < target: α becomes negative, incentivizing more active features.
-    When L0 > target: α becomes positive, penalizing excess features.
+    Inequality constraint (equality_constraint=False):
+        min_θ E[MSE(x, x̂)]  s.t. E[L0(c)] ≤ target_l0
+        L = MSE + α · max(0, L0_diff - target) + ρ/2 · max(0, L0 - target)²
+        α ← α + α_lr · (L0 - target_l0), α ∈ [0, α_max]
     
     Unlike fixed-threshold approaches, this SAE learns per-feature thresholds,
     allowing each dictionary element to find its optimal activation threshold.
@@ -143,6 +150,7 @@ class LagrangianSAE(BaseSAE):
         use_pre_enc_bias: bool = False,
         normalize_input: bool = False,
         calibrate_thresholds: bool = True,
+        equality_constraint: bool = True,
     ):
         """
         Args:
@@ -167,6 +175,7 @@ class LagrangianSAE(BaseSAE):
             use_pre_enc_bias: Whether to subtract decoder bias before encoding.
             normalize_input: Normalize input to unit variance before encoding.
             calibrate_thresholds: Auto-calibrate thresholds on first batch to achieve target L0.
+            equality_constraint: If True, enforce L0 ≈ target (equality); if False, enforce L0 <= target (inequality).
         """
         super().__init__()
         assert target_l0 > 0, "target_l0 must be positive"
@@ -188,6 +197,7 @@ class LagrangianSAE(BaseSAE):
         self.bandwidth = bandwidth
         self.use_pre_enc_bias = use_pre_enc_bias
         self.normalize_input = normalize_input
+        self.equality_constraint = equality_constraint
 
         # Loss coefficients
         self.sparsity_coeff = sparsity_coeff if sparsity_coeff is not None else 0.0  # not used directly
@@ -422,11 +432,13 @@ class LagrangianSAE(BaseSAE):
         """
         Computes the augmented Lagrangian loss for sparsity control.
         
-        Equality constraint (L0 ≈ target):
+        Equality constraint (equality_constraint=True, default):
             Loss = MSE + α * (L0_diff - target) + ρ/2 * (L0_diff - target)²
+            Penalizes both directions: L0 < target and L0 > target.
             
-        When L0 < target: Negative penalty incentivizes more active features.
-        When L0 > target: Positive penalty penalizes excess features.
+        Inequality constraint (equality_constraint=False):
+            Loss = MSE + α * max(0, L0_diff - target) + ρ/2 * max(0, L0_diff - target)²
+            Only penalizes when L0 > target; no penalty when L0 ≤ target.
         
         Uses:
         - L0_diff: Differentiable L0 approximation (provides gradient to learned thresholds)
@@ -463,12 +475,17 @@ class LagrangianSAE(BaseSAE):
         # Get current alpha value (detached to avoid gradient through alpha)
         alpha_value = self.alpha.detach().clone()
         
-        # Equality constraint: penalize both directions (no ReLU)
-        # Normalized violation for stable gradient magnitudes
-        normalized_violation = differentiable_violation / self.target_l0
+        # Compute normalized violation based on constraint type
+        if self.equality_constraint:
+            # Equality constraint: penalize both directions (no ReLU)
+            normalized_violation = differentiable_violation / self.target_l0
+        else:
+            # Inequality constraint: only penalize when L0 > target (use ReLU)
+            normalized_violation = F.relu(differentiable_violation) / self.target_l0
         
-        # Augmented Lagrangian formulation for equality constraint:
-        # L = MSE + α * (L0_diff - target) + ρ/2 * (L0_diff - target)²
+        # Augmented Lagrangian formulation:
+        # Equality: L = MSE + α * (L0_diff - target) + ρ/2 * (L0_diff - target)²
+        # Inequality: L = MSE + α * max(0, L0_diff - target) + ρ/2 * max(0, L0_diff - target)²
         sparsity_loss = alpha_value * normalized_violation
         quadratic_penalty = self.rho_quadratic * (normalized_violation ** 2)
         
@@ -506,25 +523,28 @@ class LagrangianSAE(BaseSAE):
     @torch.no_grad()
     def update_alpha(self) -> None:
         """
-        Perform dual ascent update on alpha for equality constraint.
+        Perform dual ascent update on alpha.
         
         Should be called after optimizer.step() to avoid autograd conflicts.
         
-        Uses symmetric learning rate for equality constraint:
-        - When L0 > target: α increases (positive violation)
-        - When L0 < target: α decreases (negative violation)
+        Update rule: α ← α + α_lr · (L0 - target_l0)
         
-        Alpha can be positive or negative for equality constraints:
-        - Positive α: penalizes high L0 (pushes L0 down)
-        - Negative α: incentivizes high L0 (pushes L0 up)
-        
-        Alpha is clamped to [-alpha_max, alpha_max] after update.
+        Clamping depends on constraint type:
+        - Equality (equality_constraint=True, default): α ∈ [-α_max, α_max]
+          Alpha can be negative to incentivize more features when L0 < target.
+        - Inequality (equality_constraint=False): α ∈ [0, α_max]
+          Alpha is non-negative; only penalizes when L0 > target.
         """
         if hasattr(self, '_last_constraint_violation'):
-            # Symmetric update for equality constraint
+            # Dual ascent update
             self.alpha.add_(self.alpha_lr * self._last_constraint_violation)
-            # Alpha can be negative for equality constraint
-            self.alpha.clamp_(min=-self.alpha_max, max=self.alpha_max)
+            # Clamp alpha based on constraint type
+            if self.equality_constraint:
+                # Equality: alpha can be negative (to incentivize more active features)
+                self.alpha.clamp_(min=-self.alpha_max, max=self.alpha_max)
+            else:
+                # Inequality: alpha must be non-negative (only penalizes, never incentivizes)
+                self.alpha.clamp_(min=0, max=self.alpha_max)
 
     @property
     def dict_elements(self) -> torch.Tensor:

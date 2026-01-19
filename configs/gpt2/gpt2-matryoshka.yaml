@@ -1,7 +1,7 @@
 # Experiment Settings
 wandb_project: gpt2-small
-wandb_run_name: null
-wandb_tags: ["gated"]
+wandb_run_name: matryoshka
+wandb_tags: ["matryoshka"]
 seed: 42
 
 # Model Configuration  
@@ -11,7 +11,7 @@ tlens_model_path: null
 # Training Configuration
 save_every_n_samples: null
 eval_every_n_samples: 40_000
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 1
 lr: 5e-4
 lr_schedule: cosine
 min_lr_factor: 0.1
@@ -27,20 +27,18 @@ data:
   n_train_samples: 300_000
   n_eval_samples: 1_000
   train_batch_size: 8
-  eval_batch_size: 4
+  eval_batch_size: 8
   streaming: true
   seed: null
   is_tokenized: true
   column_name: "input_ids"
   split: "train"
 
-# SAE Configuration - Gated SAE
+# SAE Configuration - Matryoshka Batch Top-K SAE
 saes:
-  name: "gated_sae"
-  sae_type: "gated"
+  name: "matryoshka_sae"
+  sae_type: "matryoshka"
   dict_size_to_input_ratio: 32.0
-  magnitude_activation: "relu"
-  magnitude_encoder: 'scale'
   pretrained_sae_paths: null
   retrain_saes: false
   sae_positions:
@@ -50,4 +48,15 @@ saes:
     - blocks.8.hook_resid_pre
     - blocks.10.hook_resid_pre
   init_decoder_orthogonal: true
-  sparsity_coeff: 0.1
+  sparsity_coeff: null
+  # Matryoshka-specific parameters
+  k: 32
+  # group_fractions defaults to [1/32, 1/16, 1/8, 1/4, 1/2 + 1/32] (5 groups)
+  # group_weights defaults to uniform
+  tied_encoder_init: true
+  # Auxiliary loss parameters for dead feature mitigation
+  aux_k: 512
+  aux_coeff: 0.03125
+  dead_toks_threshold: 10_000_000
+  # Input preprocessing
+  input_unit_norm: false

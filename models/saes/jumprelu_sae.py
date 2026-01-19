@@ -7,7 +7,12 @@ from pydantic import Field, model_validator
 from jaxtyping import Float
 
 from models.saes.base import BaseSAE, SAELoss, SAEOutput, SAEConfig
-from models.saes.utils import init_decoder_orthogonal_cuda
+from models.saes.utils import (
+    init_decoder_orthogonal_cuda,
+    update_dead_feature_stats,
+    maybe_compute_auxk_features,
+    compute_aux_loss_with_logging,
+)
 from models.saes.activations import StepFunction, JumpReLU
 from utils.enums import SAEType
 
@@ -18,16 +23,20 @@ class JumpReLUSAEConfig(SAEConfig):
     
     Notes:
     - Uses JumpReLU activation with learned thresholds
-    - L0 regularization via differentiable step function
+    - Target L0 regularization via differentiable step function: loss = ((L0 / target_l0) - 1)²
     - Bandwidth parameter controls gradient smoothness
+    - Supports auxiliary loss for dead feature mitigation (like TopK/BatchTopK)
     """
     sae_type: SAEType = Field(default=SAEType.JUMP_RELU, description="Type of SAE (automatically set to jump_relu)")
+    target_l0: float = Field(..., description="Target L0 sparsity (number of active features per sample)")
     bandwidth: float = Field(0.01, description="Bandwidth for JumpReLU gradient approximation")
     use_pre_enc_bias: bool = Field(False, description="Whether to subtract decoder bias before encoding")
     tied_encoder_init: bool = Field(True, description="Initialize encoder as decoder.T")
     
-    # Dead feature tracking
+    # Dead feature tracking and auxiliary loss
     dead_toks_threshold: int | None = Field(None, description="Threshold for considering a feature as dead (number of tokens)")
+    aux_k: int | None = Field(None, description="Auxiliary K for dead-feature loss (select top aux_k from the inactive set)")
+    aux_coeff: float | None = Field(None, description="Coefficient for the auxiliary reconstruction loss")
     
     @model_validator(mode="before")
     @classmethod
@@ -43,6 +52,8 @@ class JumpReLUSAEOutput(SAEOutput):
     """
     pre_activations: Float[torch.Tensor, "... c"]  # pre-JumpReLU activations
     l0: Float[torch.Tensor, "..."]  # L0 norm per sample
+    auxk_indices: torch.Tensor | None = None  # auxiliary top-k indices for dead latents
+    auxk_values: torch.Tensor | None = None   # auxiliary top-k values for dead latents
 
 
 class JumpReLUSAE(BaseSAE):
@@ -58,11 +69,14 @@ class JumpReLUSAE(BaseSAE):
         self,
         input_size: int,
         n_dict_components: int,
+        target_l0: float,
         bandwidth: float = 0.01,
         use_pre_enc_bias: bool = False,
-        sparsity_coeff: float | None = None,  # Used for L0 coefficient
+        sparsity_coeff: float | None = None,  # Coefficient for target L0 loss
         mse_coeff: float | None = None,
         dead_toks_threshold: int | None = None,
+        aux_k: int | None = None,
+        aux_coeff: float | None = None,
         init_decoder_orthogonal: bool = True,
         tied_encoder_init: bool = True,
     ):
@@ -70,27 +84,35 @@ class JumpReLUSAE(BaseSAE):
         Args:
             input_size: Dimensionality of inputs.
             n_dict_components: Number of dictionary features.
+            target_l0: Target L0 sparsity (number of active features per sample).
             bandwidth: Bandwidth for JumpReLU gradient approximation.
             use_pre_enc_bias: Whether to subtract decoder bias before encoding.
-            sparsity_coeff: Coefficient for L0 regularization.
+            sparsity_coeff: Coefficient for target L0 regularization loss.
             mse_coeff: Coefficient on MSE reconstruction loss.
             dead_toks_threshold: Threshold for dead feature tracking.
+            aux_k: If provided (>0), number of auxiliary features from the inactive set.
+            aux_coeff: Coefficient on the auxiliary reconstruction loss.
             init_decoder_orthogonal: Initialize decoder weights to be orthonormal.
             tied_encoder_init: Initialize encoder.weight = decoder.weight.T.
         """
         super().__init__()
         assert n_dict_components > 0 and input_size > 0
+        assert target_l0 > 0, "target_l0 must be positive"
         
         self.input_size = input_size
         self.n_dict_components = n_dict_components
+        self.target_l0 = target_l0
         self.bandwidth = bandwidth
         self.use_pre_enc_bias = use_pre_enc_bias
         
         # Loss coefficients
-        self.sparsity_coeff = sparsity_coeff if sparsity_coeff is not None else 1.0  # L0 coefficient
+        self.sparsity_coeff = sparsity_coeff if sparsity_coeff is not None else 1.0  # Target L0 loss coefficient
         self.mse_coeff = mse_coeff if mse_coeff is not None else 1.0
         
+        # Dead feature tracking and auxiliary loss
         self.dead_toks_threshold = int(dead_toks_threshold) if dead_toks_threshold is not None else None
+        self.aux_k = int(aux_k) if aux_k is not None and aux_k > 0 else 0
+        self.aux_coeff = (aux_coeff if aux_coeff is not None else 0.0) if self.aux_k > 0 else 0.0
         
         # Biases
         self.decoder_bias = nn.Parameter(torch.zeros(input_size))
@@ -119,17 +141,8 @@ class JumpReLUSAE(BaseSAE):
         if tied_encoder_init:
             self.encoder.weight.data.copy_(self.decoder.weight.data.T)
         
-        # Dead latent tracking
-        self.register_buffer("num_batches_not_active", torch.zeros(n_dict_components, dtype=torch.float32))
-    
-    def _update_dead_features(self, acts: torch.Tensor) -> None:
-        """Update dead feature tracking statistics."""
-        # Increment counter for all features
-        self.num_batches_not_active += 1.0
-        
-        # Reset counter for features that are active
-        active_mask = (acts.sum(dim=tuple(range(acts.ndim - 1))) > 0)
-        self.num_batches_not_active[active_mask] = 0.0
+        # Dead latent tracking - counts tokens since last activation (like TopK/BatchTopK)
+        self.register_buffer("stats_last_nonzero", torch.zeros(n_dict_components, dtype=torch.long))
     
     def forward(self, x: Float[torch.Tensor, "... dim"]) -> JumpReLUSAEOutput:
         """
@@ -147,6 +160,23 @@ class JumpReLUSAE(BaseSAE):
         # Apply JumpReLU activation
         feature_activations = self.jumprelu(pre_activations)
         
+        # Update dead latent statistics if training
+        update_dead_feature_stats(
+            activations=feature_activations,
+            stats_last_nonzero=self.stats_last_nonzero,
+            training=self.training,
+            dead_toks_threshold=self.dead_toks_threshold,
+        )
+        
+        # Compute auxiliary top-k indices and values for dead latents
+        auxk_values, auxk_indices = maybe_compute_auxk_features(
+            preacts=pre_activations,
+            stats_last_nonzero=self.stats_last_nonzero,
+            aux_k=self.aux_k,
+            aux_coeff=self.aux_coeff,
+            dead_toks_threshold=self.dead_toks_threshold,
+        )
+        
         # Decode
         x_reconstruct = F.linear(feature_activations, self.dict_elements) + self.decoder_bias
         
@@ -157,45 +187,57 @@ class JumpReLUSAE(BaseSAE):
             self.bandwidth
         ).sum(dim=-1)
         
-        # Update dead feature statistics if training
-        if self.training and self.dead_toks_threshold is not None:
-            self._update_dead_features(feature_activations)
-        
         return JumpReLUSAEOutput(
             input=x,
             c=feature_activations,
             output=x_reconstruct,
             logits=None,
             pre_activations=pre_activations,
-            l0=l0
+            l0=l0,
+            auxk_indices=auxk_indices,
+            auxk_values=auxk_values,
         )
     
     def compute_loss(self, output: JumpReLUSAEOutput) -> SAELoss:
         """
-        Loss = mse_coeff * MSE + sparsity_coeff * L0
+        Loss = mse_coeff * MSE + sparsity_coeff * ((L0 / target_l0) - 1)² + aux_coeff * AuxK (optional)
         
         L0 is computed using a differentiable step function approximation.
+        The sparsity loss penalizes deviation from the target L0 in either direction.
+        AuxK: Reconstruct the residual error using dead latents to provide gradient signal.
         """
         # MSE reconstruction loss
         mse_loss = F.mse_loss(output.output, output.input)
         
-        # L0 regularization
-        l0_loss = output.l0.mean()
+        # Target L0 regularization: penalize deviation from target
+        mean_l0 = output.l0.mean()
+        sparsity_loss = self.sparsity_coeff * ((mean_l0 / self.target_l0) - 1.0) ** 2
         
         # Total loss
-        total_loss = self.mse_coeff * mse_loss + self.sparsity_coeff * l0_loss
-        
-        # Compute number of dead features
-        num_dead_features = (
-            self.num_batches_not_active > self.dead_toks_threshold
-        ).sum() if self.dead_toks_threshold is not None else torch.tensor(0)
+        total_loss = self.mse_coeff * mse_loss + sparsity_loss
         
         loss_dict: dict[str, torch.Tensor] = {
             "mse_loss": mse_loss.detach().clone(),
-            "l0_loss": l0_loss.detach().clone(),
-            "l0_norm": output.l0.mean().detach().clone(),
-            "num_dead_features": num_dead_features.float(),
+            "sparsity_loss": sparsity_loss.detach().clone(),
+            "l0_norm": mean_l0.detach().clone(),
+            "target_l0": torch.tensor(self.target_l0),
         }
+        
+        # Optional auxiliary dead-feature loss using residual reconstruction
+        weighted_aux_loss, aux_loss_for_logging = compute_aux_loss_with_logging(
+            auxk_indices=output.auxk_indices,
+            auxk_values=output.auxk_values,
+            input_tensor=output.input,
+            output_tensor=output.output,
+            decoder_bias=self.decoder_bias,
+            dict_elements=self.dict_elements,
+            n_dict_components=self.n_dict_components,
+            input_size=self.input_size,
+            aux_k=self.aux_k,
+            aux_coeff=self.aux_coeff,
+        )
+        total_loss = total_loss + weighted_aux_loss
+        loss_dict["aux_loss"] = aux_loss_for_logging
         
         return SAELoss(loss=total_loss, loss_dict=loss_dict)
     

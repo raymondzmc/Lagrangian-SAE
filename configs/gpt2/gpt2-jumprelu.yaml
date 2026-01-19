@@ -11,7 +11,7 @@ tlens_model_path: null
 # Training Configuration
 save_every_n_samples: null
 eval_every_n_samples: 40_000
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 1
 lr: 5e-4
 lr_schedule: cosine
 min_lr_factor: 0.1
@@ -27,7 +27,7 @@ data:
   n_train_samples: 300_000
   n_eval_samples: 1_000
   train_batch_size: 8
-  eval_batch_size: 1
+  eval_batch_size: 8
   streaming: true
   seed: null
   is_tokenized: true
@@ -49,11 +49,14 @@ saes:
     - blocks.10.hook_resid_pre
   init_decoder_orthogonal: true
   # JumpReLU specific parameters
-  bandwidth: 0.01
-  use_pre_enc_bias: false
+  target_l0: 32.0  # Target L0 sparsity (number of active features per sample)
+  bandwidth: 0.001
+  use_pre_enc_bias: true
   tied_encoder_init: true
   # L0 regularization coefficient
   sparsity_coeff: 1.0
   mse_coeff: 1.0
-  # Dead feature tracking
-  dead_toks_threshold: 10_000
+  # Dead feature tracking and auxiliary loss
+  dead_toks_threshold: 10_000_000
+  aux_k: 512  # Number of auxiliary features from dead latents
+  aux_coeff: 0.03125  # Coefficient for auxiliary reconstruction loss

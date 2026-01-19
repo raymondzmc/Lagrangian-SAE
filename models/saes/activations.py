@@ -87,9 +87,10 @@ class StepFunction(autograd.Function):
         x_grad = torch.zeros_like(x)
         
         # Gradient w.r.t. log_threshold using rectangle approximation
+        # Multiply by threshold for log-scale gradient (chain rule: d/d(log_t) = t * d/dt)
         # This encourages threshold to move to capture/release activations
         threshold_grad = (
-            -(1.0 / bandwidth)
+            -(threshold / bandwidth)
             * RectangleFunction.apply((x - threshold) / bandwidth)
             * grad_output
         )

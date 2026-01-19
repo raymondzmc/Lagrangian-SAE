@@ -5,6 +5,7 @@ from models.saes.gated_sae import GatedSAE, GatedSAEConfig, GatedSAEOutput
 from models.saes.topk_sae import TopKSAE, TopKSAEConfig, TopKSAEOutput
 from models.saes.batch_topk_sae import BatchTopKSAE, BatchTopKSAEConfig, BatchTopKSAEOutput
 from models.saes.jumprelu_sae import JumpReLUSAE, JumpReLUSAEConfig, JumpReLUSAEOutput
+from models.saes.matryoshka_sae import MatryoshkaSAE, MatryoshkaSAEConfig, MatryoshkaSAEOutput
 from utils.enums import SAEType
 from typing import Any, Union
 import inspect
@@ -23,6 +24,7 @@ AllSAEConfigs = Union[
     TopKSAEConfig,
     BatchTopKSAEConfig,
     JumpReLUSAEConfig,
+    MatryoshkaSAEConfig,
 ]
 
 SAE_TYPE_TO_CONFIG = {
@@ -32,6 +34,7 @@ SAE_TYPE_TO_CONFIG = {
     SAEType.TOPK: TopKSAEConfig,
     SAEType.BATCH_TOPK: BatchTopKSAEConfig,
     SAEType.JUMP_RELU: JumpReLUSAEConfig,
+    SAEType.MATRYOSHKA: MatryoshkaSAEConfig,
 }
 
 
@@ -42,6 +45,7 @@ SAE_TYPE_TO_CLS = {
     SAEType.TOPK: TopKSAE,
     SAEType.BATCH_TOPK: BatchTopKSAE,
     SAEType.JUMP_RELU: JumpReLUSAE,
+    SAEType.MATRYOSHKA: MatryoshkaSAE,
 }
 
 assert set(SAE_TYPE_TO_CONFIG.keys()) == set(SAE_TYPE_TO_CLS.keys()), f"SAE_TYPE_TO_CONFIG.keys(): {SAE_TYPE_TO_CONFIG.keys()} != SAE_TYPE_TO_CLS.keys(): {SAE_TYPE_TO_CLS.keys()}"
@@ -94,6 +98,9 @@ __all__ = [
     "JumpReLUSAE",
     "JumpReLUSAEConfig",
     "JumpReLUSAEOutput",
+    "MatryoshkaSAE",
+    "MatryoshkaSAEConfig",
+    "MatryoshkaSAEOutput",
     "create_sae_config",
     "AllSAEConfigs",
 ]

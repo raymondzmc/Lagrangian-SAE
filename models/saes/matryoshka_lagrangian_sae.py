@@ -1,0 +1,492 @@
+# matryoshka_lagrangian_sae.py
+"""
+Matryoshka Lagrangian SAE - Combines Matryoshka's progressive group structure
+with LagrangianSAE's adaptive sparsity control.
+
+Key features:
+- Progressive reconstruction loss at each group boundary (Matryoshka)
+- JumpReLU activation with per-feature learned thresholds (Lagrangian)
+- Dual ascent on alpha to achieve target L0 sparsity (Lagrangian)
+- Differentiable L0 approximation for gradient computation
+- Running mean (EMA) of L0 for stable constraint evaluation
+"""
+import torch
+import torch.nn.functional as F
+from torch import nn
+from typing import Any
+from pydantic import Field, model_validator
+from jaxtyping import Float
+from math import isclose
+
+from models.saes.base import BaseSAE, SAELoss, SAEOutput, SAEConfig
+from models.saes.utils import (
+    init_decoder_orthogonal_cuda,
+    update_dead_feature_stats,
+    maybe_compute_auxk_features,
+    compute_aux_loss_with_logging,
+)
+from models.saes.activations import StepFunction, JumpReLU
+from utils.enums import SAEType
+
+
+class MatryoshkaLagrangianSAEConfig(SAEConfig):
+    """
+    Config for Matryoshka Lagrangian SAE.
+
+    Combines Matryoshka's progressive group structure with LagrangianSAE's
+    adaptive sparsity control via dual ascent.
+    
+    Notes:
+    - Features are divided into groups via group_fractions (must sum to 1.0)
+    - Loss is computed progressively at each group boundary
+    - Uses JumpReLU activation with per-feature learned thresholds
+    - Dual ascent on alpha to achieve target L0 sparsity
+    """
+    sae_type: SAEType = Field(
+        default=SAEType.MATRYOSHKA_LAGRANGIAN, 
+        description="Type of SAE (automatically set to matryoshka_lagrangian)"
+    )
+    
+    # Matryoshka group configuration
+    group_fractions: list[float] = Field(
+        default=[1/32, 1/16, 1/8, 1/4, 1/2 + 1/32],
+        description="Fractions of dict_size for each group (must sum to 1.0)"
+    )
+    group_weights: list[float] | None = Field(
+        None, 
+        description="Weights for loss at each group boundary (default: uniform)"
+    )
+    
+    # Lagrangian sparsity control
+    target_l0: float = Field(..., description="Target L0 sparsity (number of active features per sample)")
+    initial_alpha: float = Field(0.0, description="Initial alpha for Lagrangian multiplier")
+    alpha_lr: float = Field(1e-2, description="Learning rate for alpha dual ascent")
+    alpha_max: float = Field(100.0, description="Maximum value for alpha to prevent instability")
+    rho_quadratic: float = Field(0.1, description="Coefficient for quadratic penalty in augmented Lagrangian")
+    l0_ema_momentum: float = Field(0.99, description="Momentum for running mean of L0")
+    equality_constraint: bool = Field(True, description="If True, enforce L0 ≈ target; if False, enforce L0 <= target")
+    
+    # JumpReLU threshold parameters
+    initial_threshold: float = Field(0.5, description="Initial per-feature threshold value")
+    bandwidth: float = Field(0.5, description="Bandwidth for step function gradient approximation")
+    calibrate_thresholds: bool = Field(True, description="Auto-calibrate thresholds on first batch")
+    
+    # Standard SAE parameters
+    tied_encoder_init: bool = Field(True, description="Initialize encoder as decoder.T")
+    use_pre_enc_bias: bool = Field(False, description="Subtract decoder bias before encoding")
+    
+    # Dead feature tracking and auxiliary loss
+    dead_toks_threshold: int | None = Field(None, description="Threshold for considering a feature as dead")
+    aux_k: int | None = Field(None, description="Auxiliary K for dead-feature loss")
+    aux_coeff: float | None = Field(None, description="Coefficient for the auxiliary reconstruction loss")
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_sae_type(cls, values: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(values, dict):
+            values["sae_type"] = SAEType.MATRYOSHKA_LAGRANGIAN
+        return values
+
+    @model_validator(mode="after")
+    def validate_group_fractions(self) -> "MatryoshkaLagrangianSAEConfig":
+        """Validate that group_fractions sum to 1.0."""
+        if not isclose(sum(self.group_fractions), 1.0, rel_tol=1e-5):
+            raise ValueError(f"group_fractions must sum to 1.0, got {sum(self.group_fractions)}")
+        if any(f <= 0 for f in self.group_fractions):
+            raise ValueError("All group_fractions must be positive")
+        return self
+
+    @model_validator(mode="after")
+    def validate_group_weights(self) -> "MatryoshkaLagrangianSAEConfig":
+        """Validate group_weights if provided."""
+        if self.group_weights is not None:
+            if len(self.group_weights) != len(self.group_fractions):
+                raise ValueError(
+                    f"group_weights length ({len(self.group_weights)}) must match "
+                    f"group_fractions length ({len(self.group_fractions)})"
+                )
+        return self
+
+
+class MatryoshkaLagrangianSAEOutput(SAEOutput):
+    """
+    Matryoshka Lagrangian SAE output combining both paradigms.
+    """
+    preacts: Float[torch.Tensor, "... c"]  # encoder outputs (after ReLU, before JumpReLU)
+    l0: Float[torch.Tensor, "..."]  # L0 norm per sample (actual count)
+    l0_differentiable: Float[torch.Tensor, "..."]  # Differentiable L0 for gradients
+    alpha: torch.Tensor  # current Lagrangian multiplier value
+    auxk_indices: torch.Tensor | None = None
+    auxk_values: torch.Tensor | None = None
+
+
+class MatryoshkaLagrangianSAE(BaseSAE):
+    """
+    Matryoshka Lagrangian Sparse Autoencoder:
+      - Linear encoder/decoder with biases
+      - JumpReLU activation with per-feature learned thresholds
+      - Dual ascent on alpha to achieve target sparsity
+      - Progressive MSE loss at each group boundary
+      - Optional auxiliary loss for dead features
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        n_dict_components: int,
+        target_l0: float,
+        group_fractions: list[float] | None = None,
+        group_weights: list[float] | None = None,
+        initial_alpha: float = 0.0,
+        alpha_lr: float = 1e-2,
+        alpha_max: float = 100.0,
+        rho_quadratic: float = 0.1,
+        l0_ema_momentum: float = 0.99,
+        equality_constraint: bool = True,
+        initial_threshold: float = 0.5,
+        bandwidth: float = 0.5,
+        calibrate_thresholds: bool = True,
+        sparsity_coeff: float | None = None,  # unused; kept for API parity
+        mse_coeff: float | None = None,
+        aux_k: int | None = None,
+        aux_coeff: float | None = None,
+        dead_toks_threshold: int | None = None,
+        init_decoder_orthogonal: bool = True,
+        tied_encoder_init: bool = True,
+        use_pre_enc_bias: bool = False,
+    ):
+        """
+        Args:
+            input_size: Dimensionality of inputs (e.g., residual stream width).
+            n_dict_components: Number of dictionary features (latent size).
+            target_l0: Target number of active features per sample.
+            group_fractions: Fractions of dict_size for each group (must sum to 1.0).
+                Default: [1/32, 1/16, 1/8, 1/4, 1/2 + 1/32] (5 groups).
+            group_weights: Weights for loss at each group boundary (default: uniform).
+            initial_alpha: Initial value for Lagrangian multiplier.
+            alpha_lr: Learning rate for alpha dual ascent.
+            alpha_max: Maximum absolute value for alpha.
+            rho_quadratic: Coefficient for quadratic penalty in augmented Lagrangian.
+            l0_ema_momentum: Momentum for running mean of L0.
+            equality_constraint: If True, enforce L0 ≈ target; if False, L0 <= target.
+            initial_threshold: Initial per-feature threshold value.
+            bandwidth: Bandwidth for step function gradient approximation.
+            calibrate_thresholds: Auto-calibrate thresholds on first batch.
+            sparsity_coeff: Unused (present for interface compatibility).
+            mse_coeff: Coefficient on MSE reconstruction loss (default 1.0).
+            aux_k: Number of auxiliary features for dead latents.
+            aux_coeff: Coefficient on the auxiliary reconstruction loss.
+            dead_toks_threshold: Threshold for considering a feature as dead.
+            init_decoder_orthogonal: Initialize decoder weight columns to be orthonormal.
+            tied_encoder_init: Initialize encoder.weight = decoder.weight.T.
+            use_pre_enc_bias: Whether to subtract decoder bias before encoding.
+        """
+        super().__init__()
+        assert target_l0 > 0, "target_l0 must be positive"
+        assert n_dict_components > 0 and input_size > 0
+        assert bandwidth > 0, "bandwidth must be positive"
+        assert 0.0 <= l0_ema_momentum < 1.0, "l0_ema_momentum must be in [0, 1)"
+
+        self.input_size = input_size
+        self.n_dict_components = n_dict_components
+        self.target_l0 = target_l0
+        self.alpha_lr = alpha_lr
+        self.alpha_max = alpha_max
+        self.rho_quadratic = rho_quadratic
+        self.l0_ema_momentum = l0_ema_momentum
+        self.bandwidth = bandwidth
+        self.use_pre_enc_bias = use_pre_enc_bias
+        self.equality_constraint = equality_constraint
+
+        # Set default group fractions if not provided
+        if group_fractions is None:
+            group_fractions = [1/32, 1/16, 1/8, 1/4, 1/2 + 1/32]
+
+        # Validate group fractions
+        assert isclose(sum(group_fractions), 1.0, rel_tol=1e-5), "group_fractions must sum to 1.0"
+        assert all(f > 0 for f in group_fractions), "all group_fractions must be positive"
+
+        # Compute group sizes from fractions
+        group_sizes = [int(f * n_dict_components) for f in group_fractions[:-1]]
+        group_sizes.append(n_dict_components - sum(group_sizes))
+        
+        self.num_groups = len(group_sizes)
+        self.register_buffer("group_sizes", torch.tensor(group_sizes, dtype=torch.long))
+        
+        # Compute cumulative group boundaries
+        boundaries = [0]
+        for size in group_sizes:
+            boundaries.append(boundaries[-1] + size)
+        self.register_buffer("group_boundaries", torch.tensor(boundaries, dtype=torch.long))
+        
+        # Set group weights (default: uniform)
+        if group_weights is None:
+            group_weights = [1.0 / self.num_groups] * self.num_groups
+        assert len(group_weights) == self.num_groups, "group_weights must match number of groups"
+        self.register_buffer("group_weights", torch.tensor(group_weights, dtype=torch.float32))
+
+        # Loss coefficients
+        self.sparsity_coeff = sparsity_coeff if sparsity_coeff is not None else 0.0
+        self.mse_coeff = mse_coeff if mse_coeff is not None else 1.0
+
+        self.dead_toks_threshold = int(dead_toks_threshold) if dead_toks_threshold is not None else None
+        self.aux_k = int(aux_k) if aux_k is not None and aux_k > 0 else 0
+        self.aux_coeff = (aux_coeff if aux_coeff is not None else 0.0) if self.aux_k > 0 else 0.0
+
+        # Lagrangian multiplier (alpha) as a buffer
+        self.register_buffer("alpha", torch.tensor(initial_alpha, dtype=torch.float32))
+        
+        # Running mean of L0 for stable constraint evaluation (EMA)
+        self.register_buffer("running_l0", torch.tensor(target_l0, dtype=torch.float32))
+
+        # Biases
+        self.decoder_bias = nn.Parameter(torch.zeros(input_size))
+        self.encoder_bias = nn.Parameter(torch.zeros(n_dict_components))
+
+        # Linear maps (no bias in linear layers - biases are separate)
+        self.encoder = nn.Linear(input_size, n_dict_components, bias=False)
+        self.decoder = nn.Linear(n_dict_components, input_size, bias=False)
+        
+        # JumpReLU activation with per-feature learned thresholds
+        self.jumprelu = JumpReLU(
+            feature_size=n_dict_components,
+            bandwidth=bandwidth,
+            initial_threshold=initial_threshold,
+        )
+
+        # Initialize decoder, then (optionally) tie encoder init to decoder^T
+        if init_decoder_orthogonal:
+            self.decoder.weight.data = init_decoder_orthogonal_cuda(self.decoder.weight)
+        else:
+            dec_w = torch.randn_like(self.decoder.weight)
+            dec_w = F.normalize(dec_w, dim=0)
+            self.decoder.weight.data.copy_(dec_w)
+
+        if tied_encoder_init:
+            self.encoder.weight.data.copy_(self.decoder.weight.data.T)
+
+        # Dead latent tracking
+        self.register_buffer("stats_last_nonzero", torch.zeros(n_dict_components, dtype=torch.long))
+        
+        # Threshold calibration state
+        self.calibrate_thresholds = calibrate_thresholds
+        if self.calibrate_thresholds:
+            self.register_buffer("thresholds_calibrated", torch.tensor(False))
+
+    @torch.no_grad()
+    def _calibrate_thresholds_from_preacts(self, preacts: torch.Tensor) -> None:
+        """
+        Calibrate thresholds based on pre-activation statistics.
+        
+        Sets per-feature thresholds such that the expected L0 ≈ target_l0.
+        """
+        flat_preacts = preacts.reshape(-1, self.n_dict_components)
+        n_samples = flat_preacts.shape[0]
+        
+        # Target: each feature should activate with probability target_l0 / n_dict_components
+        target_activation_prob = self.target_l0 / self.n_dict_components
+        target_percentile = 1.0 - target_activation_prob
+        
+        # Compute per-feature threshold at target percentile
+        sorted_preacts, _ = torch.sort(flat_preacts, dim=0)
+        percentile_idx = int(target_percentile * n_samples)
+        percentile_idx = min(percentile_idx, n_samples - 1)
+        
+        threshold_values = sorted_preacts[percentile_idx, :]
+        threshold_values = threshold_values.clamp(min=1e-4)
+        
+        self.jumprelu.log_threshold.data.copy_(torch.log(threshold_values))
+        self.thresholds_calibrated.fill_(True)
+        
+        mean_threshold = threshold_values.mean().item()
+        min_threshold = threshold_values.min().item()
+        max_threshold = threshold_values.max().item()
+        print(f"[MatryoshkaLagrangianSAE] Thresholds calibrated: mean={mean_threshold:.4f}, "
+              f"min={min_threshold:.4f}, max={max_threshold:.4f}")
+
+    def forward(self, x: Float[torch.Tensor, "... dim"]) -> MatryoshkaLagrangianSAEOutput:
+        """
+        Forward pass with JumpReLU activation and learned thresholds.
+        """
+        # Optional: subtract decoder bias before encoding
+        if self.use_pre_enc_bias:
+            x_enc = x - self.decoder_bias
+        else:
+            x_enc = x
+
+        # Encoder with ReLU pre-activation
+        preacts = F.relu(self.encoder(x_enc) + self.encoder_bias)
+        
+        # Threshold calibration on first batch
+        if self.calibrate_thresholds and self.training and not self.thresholds_calibrated:
+            with torch.no_grad():
+                self._calibrate_thresholds_from_preacts(preacts)
+        
+        # Apply JumpReLU with per-feature learned thresholds
+        c = self.jumprelu(preacts)
+
+        # Update dead latent statistics
+        update_dead_feature_stats(
+            activations=c,
+            stats_last_nonzero=self.stats_last_nonzero,
+            training=self.training,
+            dead_toks_threshold=self.dead_toks_threshold,
+        )
+
+        # Compute auxiliary top-k for dead latents
+        auxk_values, auxk_indices = maybe_compute_auxk_features(
+            preacts=preacts,
+            stats_last_nonzero=self.stats_last_nonzero,
+            aux_k=self.aux_k,
+            aux_coeff=self.aux_coeff,
+            dead_toks_threshold=self.dead_toks_threshold,
+        )
+
+        # Decode using normalized dictionary elements + bias
+        x_hat = F.linear(c, self.dict_elements, bias=self.decoder_bias)
+
+        # Compute true L0
+        l0 = (c > 0).float().sum(dim=-1)
+        
+        # Compute differentiable L0 using StepFunction
+        l0_differentiable = StepFunction.apply(
+            preacts, 
+            self.jumprelu.log_threshold, 
+            self.bandwidth
+        ).sum(dim=-1)
+
+        return MatryoshkaLagrangianSAEOutput(
+            input=x,
+            c=c,
+            output=x_hat,
+            logits=None,
+            preacts=preacts,
+            l0=l0,
+            l0_differentiable=l0_differentiable,
+            alpha=self.alpha,
+            auxk_indices=auxk_indices,
+            auxk_values=auxk_values,
+        )
+
+    def compute_loss(self, output: MatryoshkaLagrangianSAEOutput) -> SAELoss:
+        """
+        Computes the combined Matryoshka progressive loss + Lagrangian sparsity penalty.
+        
+        Loss = Σ(group_weight[i] * MSE_i) + α * (L0 - target) + ρ/2 * (L0 - target)²
+        """
+        # Flatten for loss computation
+        input_for_loss = output.input.reshape(-1, self.input_size)
+        acts = output.c.reshape(-1, self.n_dict_components)
+        
+        # Get normalized decoder weights
+        dict_elements = self.dict_elements
+        
+        # Progressive reconstruction at each group boundary (Matryoshka)
+        x_reconstruct = self.decoder_bias.unsqueeze(0).expand(acts.shape[0], -1).clone()
+        
+        total_mse_loss = torch.tensor(0.0, device=acts.device, dtype=acts.dtype)
+        group_losses = []
+        
+        for i in range(self.num_groups):
+            group_start = self.group_boundaries[i].item()
+            group_end = self.group_boundaries[i + 1].item()
+            
+            acts_slice = acts[:, group_start:group_end]
+            W_dec_slice = dict_elements[:, group_start:group_end]
+            
+            x_reconstruct = x_reconstruct + F.linear(acts_slice, W_dec_slice)
+            
+            group_mse = F.mse_loss(x_reconstruct, input_for_loss)
+            group_losses.append(group_mse.detach().clone())
+            
+            total_mse_loss = total_mse_loss + self.group_weights[i] * group_mse
+        
+        # Compute mean L0 across batch
+        mean_l0 = output.l0.mean()
+        
+        # Update running L0 (EMA)
+        if self.training:
+            with torch.no_grad():
+                self.running_l0.mul_(self.l0_ema_momentum).add_(
+                    (1.0 - self.l0_ema_momentum) * mean_l0.detach()
+                )
+        
+        # Store constraint violation for dual ascent
+        running_constraint_violation = self.running_l0 - self.target_l0
+        self._last_constraint_violation = running_constraint_violation.detach().clone()
+        
+        # Differentiable L0 for gradient computation
+        mean_l0_diff = output.l0_differentiable.mean()
+        differentiable_violation = mean_l0_diff - self.target_l0
+        
+        # Get current alpha value (detached)
+        alpha_value = self.alpha.detach().clone()
+        
+        # Compute normalized violation based on constraint type
+        if self.equality_constraint:
+            normalized_violation = differentiable_violation / self.target_l0
+        else:
+            normalized_violation = F.relu(differentiable_violation) / self.target_l0
+        
+        # Augmented Lagrangian sparsity penalty
+        sparsity_loss = alpha_value * normalized_violation
+        quadratic_penalty = self.rho_quadratic * (normalized_violation ** 2)
+        
+        # Total loss
+        total_loss = self.mse_coeff * total_mse_loss + sparsity_loss + quadratic_penalty
+        
+        # Build loss dict
+        mean_threshold = self.jumprelu.threshold.mean()
+        loss_dict: dict[str, torch.Tensor] = {
+            "mse_loss": total_mse_loss.detach().clone(),
+            "running_l0": self.running_l0.detach().clone(),
+            "alpha": alpha_value,
+            "quadratic_penalty": quadratic_penalty.detach().clone(),
+            "mean_threshold": mean_threshold.detach().clone(),
+        }
+        
+        # Add individual group losses
+        for i, gl in enumerate(group_losses):
+            loss_dict[f"mse_loss_group_{i}"] = gl
+
+        # Auxiliary dead-feature loss
+        x_hat_full = output.output.reshape(-1, self.input_size)
+        weighted_aux_loss, aux_loss_for_logging = compute_aux_loss_with_logging(
+            auxk_indices=output.auxk_indices,
+            auxk_values=output.auxk_values,
+            input_tensor=input_for_loss,
+            output_tensor=x_hat_full,
+            decoder_bias=self.decoder_bias,
+            dict_elements=dict_elements,
+            n_dict_components=self.n_dict_components,
+            input_size=self.input_size,
+            aux_k=self.aux_k,
+            aux_coeff=self.aux_coeff,
+        )
+        total_loss = total_loss + weighted_aux_loss
+        loss_dict["aux_loss"] = aux_loss_for_logging
+
+        return SAELoss(loss=total_loss, loss_dict=loss_dict)
+    
+    @torch.no_grad()
+    def update_alpha(self) -> None:
+        """
+        Perform dual ascent update on alpha.
+        
+        Should be called after optimizer.step() to avoid autograd conflicts.
+        """
+        if hasattr(self, '_last_constraint_violation'):
+            self.alpha.add_(self.alpha_lr * self._last_constraint_violation)
+            if self.equality_constraint:
+                self.alpha.clamp_(min=-self.alpha_max, max=self.alpha_max)
+            else:
+                self.alpha.clamp_(min=0, max=self.alpha_max)
+
+    @property
+    def dict_elements(self) -> torch.Tensor:
+        """Column-wise unit-norm decoder (dictionary)."""
+        return F.normalize(self.decoder.weight, dim=0)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device

@@ -10,6 +10,7 @@ class SAEType(str, Enum):
     BATCH_TOPK = "batch_topk"
     JUMP_RELU = "jump_relu"
     MATRYOSHKA = "matryoshka"
+    MATRYOSHKA_LAGRANGIAN = "matryoshka_lagrangian"
 
 
 class EncoderType(str, Enum):

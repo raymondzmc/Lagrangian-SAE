@@ -1,0 +1,56 @@
+# Matryoshka BatchTopK SAE - K=64 comparison experiment
+wandb_project: gpt2-small-matryoshka
+wandb_run_name: matryoshka_batchtopk_k64
+wandb_tags: ["matryoshka", "batchtopk", "k64", "comparison"]
+seed: 42
+
+# Model Configuration  
+tlens_model_name: "gpt2-small" 
+tlens_model_path: null
+
+# Training Configuration
+save_every_n_samples: null
+eval_every_n_samples: 20_000
+gradient_accumulation_steps: 1
+lr: 5e-4
+lr_schedule: cosine
+min_lr_factor: 0.1
+warmup_samples: 10_000
+max_grad_norm: 10.0
+log_every_n_grad_steps: 20
+
+# Data Configuration
+data:
+  dataset_name: "apollo-research/Skylion007-openwebtext-tokenizer-gpt2"
+  tokenizer_name: "gpt2"
+  context_length: 1024
+  n_train_samples: 300_000
+  n_eval_samples: 1_000
+  train_batch_size: 8
+  eval_batch_size: 1
+  streaming: true
+  seed: null
+  is_tokenized: true
+  column_name: "input_ids"
+  split: "train"
+
+# SAE Configuration - Matryoshka BatchTopK SAE
+saes:
+  name: "matryoshka_batchtopk_k64"
+  sae_type: "matryoshka"
+  dict_size_to_input_ratio: 32.0
+  pretrained_sae_paths: null
+  retrain_saes: false
+  sae_positions:
+    - blocks.8.hook_resid_pre
+  init_decoder_orthogonal: true
+  sparsity_coeff: null
+  # K=64 for comparison
+  k: 64
+  # Default group_fractions: [1/32, 1/16, 1/8, 1/4, 1/2 + 1/32]
+  tied_encoder_init: true
+  # Auxiliary loss
+  aux_k: 512
+  aux_coeff: 0.03125
+  dead_toks_threshold: 10_000_000
+  input_unit_norm: false

@@ -1,0 +1,294 @@
+{
+  "$defs": {
+    "BaseResultDetail": {
+      "properties": {},
+      "title": "BaseResultDetail",
+      "type": "object"
+    },
+    "RAVELEvalConfig": {
+      "properties": {
+        "entity_attribute_selection": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {
+            "city": [
+              "Country",
+              "Continent",
+              "Language"
+            ],
+            "nobel_prize_winner": [
+              "Country of Birth",
+              "Field",
+              "Gender"
+            ]
+          },
+          "description": "Subset of the RAVEL datset to be evaluated. Each key is an entity class, and the value is a list of at least two attribute classes.",
+          "title": "Selection of entity and attribute classes",
+          "type": "object"
+        },
+        "top_n_entities": {
+          "default": 500,
+          "description": "Number of entities in the dataset, filtered by prediction accuracy over attributes / templates.",
+          "title": "Number of distinct entities in the dataset",
+          "type": "integer"
+        },
+        "top_n_templates": {
+          "default": 90,
+          "description": "Number of templates in the dataset, filtered by prediction accuracy over entities.",
+          "title": "Number of distinct templates in the dataset",
+          "type": "integer"
+        },
+        "full_dataset_downsample": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Downsample the full dataset to this size.",
+          "title": "Full Dataset Downsample"
+        },
+        "num_pairs_per_attribute": {
+          "default": 5000,
+          "description": "Number of pairs per attribute",
+          "title": "Number of Pairs per Attribute",
+          "type": "integer"
+        },
+        "train_test_split": {
+          "default": 0.7,
+          "description": "Fraction of dataset to use for training.",
+          "title": "Train Test Split",
+          "type": "number"
+        },
+        "force_dataset_recompute": {
+          "default": false,
+          "description": "Force recomputation of the dataset, ie. generating model predictions for attribute values, evaluating, and downsampling.",
+          "title": "Force Dataset Recompute",
+          "type": "boolean"
+        },
+        "model_name": {
+          "default": "gemma-2-2b",
+          "description": "Model name",
+          "title": "Model Name",
+          "type": "string"
+        },
+        "llm_dtype": {
+          "default": "bfloat16",
+          "description": "LLM data type",
+          "title": "LLM Data Type",
+          "type": "string"
+        },
+        "llm_batch_size": {
+          "default": 2048,
+          "description": "LLM batch size, inference only",
+          "title": "LLM Batch Size",
+          "type": "integer"
+        },
+        "learning_rate": {
+          "default": 0.001,
+          "description": "Learning rate for the MDBM",
+          "title": "Learning Rate",
+          "type": "number"
+        },
+        "num_epochs": {
+          "default": 2,
+          "description": "Number of training epochs",
+          "title": "Number of Epochs",
+          "type": "integer"
+        },
+        "train_mdas": {
+          "default": false,
+          "description": "If True, we completely ignore the SAE and train an MDAS instead.",
+          "title": "Train MDAS",
+          "type": "boolean"
+        },
+        "n_generated_tokens": {
+          "default": 6,
+          "description": "Number of tokens to generate for each intervention. 8 was used in the RAVEL paper",
+          "title": "Number of Generated Tokens",
+          "type": "integer"
+        },
+        "random_seed": {
+          "default": 42,
+          "description": "Random seed",
+          "title": "Random Seed",
+          "type": "integer"
+        },
+        "artifact_dir": {
+          "default": "artifacts/ravel",
+          "description": "Directory to save artifacts",
+          "title": "Artifact Directory",
+          "type": "string"
+        }
+      },
+      "title": "RAVELEvalConfig",
+      "type": "object"
+    },
+    "RAVELMetricCategories": {
+      "properties": {
+        "ravel": {
+          "$ref": "#/$defs/RAVELMetricResults",
+          "description": "RAVEL metrics",
+          "title": "RAVEL",
+          "ui_default_display": true
+        }
+      },
+      "required": [
+        "ravel"
+      ],
+      "title": "RAVELMetricCategories",
+      "type": "object"
+    },
+    "RAVELMetricResults": {
+      "properties": {
+        "disentanglement_score": {
+          "description": "Mean of cause and isolation scores across RAVEL datasets.",
+          "title": "Disentanglement Score",
+          "type": "number",
+          "ui_default_display": true
+        },
+        "cause_score": {
+          "description": "Cause score: Patching attribute-related SAE latents. High cause accuracy indicates that the SAE latents are related to the attribute.",
+          "title": "Cause Score",
+          "type": "number",
+          "ui_default_display": true
+        },
+        "isolation_score": {
+          "description": "Isolation score: Patching SAE latents related to another attribute. High isolation accuracy indicates that latents related to another attribute are not related to this attribute.",
+          "title": "Isolation Score",
+          "type": "number",
+          "ui_default_display": true
+        }
+      },
+      "required": [
+        "disentanglement_score",
+        "cause_score",
+        "isolation_score"
+      ],
+      "title": "RAVELMetricResults",
+      "type": "object"
+    }
+  },
+  "description": "An evaluation using SAEs for targeted modification of language model output. We leverage the RAVEL dataset of entity-attribute pairs. After filtering for known pairs, we identify attribute-related SAE latents and deterimine the effect on model predictions with activation patching experiments.",
+  "properties": {
+    "eval_type_id": {
+      "default": "ravel",
+      "title": "Eval Type Id",
+      "type": "string"
+    },
+    "eval_config": {
+      "$ref": "#/$defs/RAVELEvalConfig",
+      "description": "The configuration of the evaluation.",
+      "title": "Eval Config Type"
+    },
+    "eval_id": {
+      "description": "A unique UUID identifying this specific eval run",
+      "title": "ID",
+      "type": "string"
+    },
+    "datetime_epoch_millis": {
+      "description": "The datetime of the evaluation in epoch milliseconds",
+      "title": "DateTime (epoch ms)",
+      "type": "integer"
+    },
+    "eval_result_metrics": {
+      "$ref": "#/$defs/RAVELMetricCategories",
+      "description": "The metrics of the evaluation, organized by category. Define your own categories and the metrics that go inside them.",
+      "title": "Result Metrics Categorized"
+    },
+    "eval_result_details": {
+      "default": null,
+      "description": "Optional. The details of the evaluation. A list of objects that stores nested or more detailed data, such as details about the absorption of each letter.",
+      "items": {
+        "$ref": "#/$defs/BaseResultDetail"
+      },
+      "title": "Result Details",
+      "type": "array"
+    },
+    "sae_bench_commit_hash": {
+      "description": "The commit hash of the SAE Bench that ran the evaluation.",
+      "title": "SAE Bench Commit Hash",
+      "type": "string"
+    },
+    "sae_lens_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The ID of the SAE in SAE Lens.",
+      "title": "SAE Lens ID"
+    },
+    "sae_lens_release_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The release ID of the SAE in SAE Lens.",
+      "title": "SAE Lens Release ID"
+    },
+    "sae_lens_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The version of SAE Lens that ran the evaluation.",
+      "title": "SAE Lens Version"
+    },
+    "sae_cfg_dict": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The configuration of the SAE (custom or from SAE Lens) that ran the evaluation. This should match the SAE Lens config schema.",
+      "title": "SAE Config Dict"
+    },
+    "eval_result_unstructured": {
+      "anyOf": [
+        {},
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional. Any additional outputs that don't fit into the structured eval_result_metrics or eval_result_details fields. Since these are unstructured, don't expect this to be easily renderable in UIs, or contain any titles or descriptions.",
+      "title": "Unstructured Results"
+    }
+  },
+  "required": [
+    "eval_config",
+    "eval_id",
+    "datetime_epoch_millis",
+    "eval_result_metrics",
+    "sae_bench_commit_hash",
+    "sae_lens_id",
+    "sae_lens_release_id",
+    "sae_lens_version",
+    "sae_cfg_dict"
+  ],
+  "title": "RAVEL",
+  "type": "object"
+}

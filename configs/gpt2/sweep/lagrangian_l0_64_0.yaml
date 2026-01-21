@@ -1,5 +1,6 @@
 
 target_l0: [64]
-equality_constraint: [False]
+alpha_max: [5]
+# equality_constraint: [False]
 # bandwidth: [0.1]
 # rho_quadratic: [0.1, 0.001, 0]

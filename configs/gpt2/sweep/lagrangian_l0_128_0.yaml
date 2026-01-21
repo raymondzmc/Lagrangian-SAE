@@ -1,5 +1,6 @@
 # wandb_project: "gpt2-small-sweep"
 target_l0: [128]
+alpha_max: [5]
 # l0_ema_momentum: [0.9]
-equality_constraint: [False]
-# rho_quadratic: [0.1, 0.001, 0]
+# equality_constraint: [False]
+# # rho_quadratic: [0.1, 0.001, 0]

@@ -47,7 +47,7 @@ class RectangleFunction(autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return ((x > -0.5) & (x < 0.5)).float()
+        return ((x > -0.5) & (x < 0.5)).to(x.dtype)
     
     @staticmethod
     def backward(ctx, grad_output):
@@ -58,42 +58,40 @@ class RectangleFunction(autograd.Function):
 
 
 class StepFunction(autograd.Function):
-    """Step function for L0 computation with gradient to learned log-thresholds.
+    """Step function for L0 computation with gradient to learned thresholds.
     
     Used when thresholds are learned parameters (e.g., JumpReLU SAE).
     
-    Forward: H(x - exp(log_threshold)) = 1 if x > exp(log_threshold), else 0
-    Backward: Gradient only flows to log_threshold (not to x)
+    Forward: H(x - threshold) = 1 if x > threshold, else 0
+    Backward: Gradient only flows to threshold (not to x).
+              Returns gradient w.r.t. threshold (θ), not log_threshold.
+              Autodiff handles chain rule through exp(log_threshold) outside.
     
     Args:
         x: Pre-activations (after ReLU)
-        log_threshold: Log of threshold (learned parameter, per-feature)
+        threshold: Threshold value (computed as exp(log_threshold) outside this function)
         bandwidth: Controls gradient width (smaller = sharper gradient)
     """
     
     @staticmethod
-    def forward(ctx, x, log_threshold, bandwidth):
-        ctx.save_for_backward(x, log_threshold, torch.tensor(bandwidth))
-        threshold = torch.exp(log_threshold)
-        return (x > threshold).float()
+    def forward(ctx, x, threshold, bandwidth: float):
+        ctx.save_for_backward(x, threshold)
+        ctx.bandwidth = float(bandwidth)
+        return (x > threshold).to(x.dtype)
     
     @staticmethod
     def backward(ctx, grad_output):
-        x, log_threshold, bandwidth_tensor = ctx.saved_tensors
-        bandwidth = bandwidth_tensor.item()
-        threshold = torch.exp(log_threshold)
+        x, threshold = ctx.saved_tensors
+        bw = ctx.bandwidth
         
         # No gradient w.r.t. x for step function (hard decision)
         x_grad = torch.zeros_like(x)
         
-        # Gradient w.r.t. log_threshold using rectangle approximation
-        # Multiply by threshold for log-scale gradient (chain rule: d/d(log_t) = t * d/dt)
-        # This encourages threshold to move to capture/release activations
-        threshold_grad = (
-            -(threshold / bandwidth)
-            * RectangleFunction.apply((x - threshold) / bandwidth)
-            * grad_output
-        )
+        # Gradient w.r.t. threshold (∂L/∂θ)
+        # Paper's pseudo-derivative for Heaviside: ∂_θ H(z-θ) = -1/ε * K((z-θ)/ε)
+        # Autodiff will multiply by θ through exp(log_threshold) to get ∂L/∂log_θ
+        rect = (((x - threshold) / bw > -0.5) & ((x - threshold) / bw < 0.5)).to(grad_output.dtype)
+        threshold_grad = -(1.0 / bw) * rect * grad_output
         
         return x_grad, threshold_grad, None  # None for bandwidth
 
@@ -101,40 +99,38 @@ class StepFunction(autograd.Function):
 class JumpReLUFunction(autograd.Function):
     """JumpReLU activation function with learned thresholds.
     
-    Forward: x * (x > exp(log_threshold))
+    Forward: x * (x > threshold)
              Returns x if x > threshold, else 0 (hard sparsity)
     
     Backward: Gradient flows through for active units (x > threshold)
-              Also provides gradient to log_threshold to learn optimal thresholds
+              Returns gradient w.r.t. threshold (θ), not log_threshold.
+              Autodiff handles chain rule through exp(log_threshold) outside.
     
     Args:
         x: Pre-activations (after ReLU)
-        log_threshold: Log of threshold (learned parameter, per-feature)
+        threshold: Threshold value (computed as exp(log_threshold) outside this function)
         bandwidth: Controls gradient width for threshold learning
     """
     
     @staticmethod
-    def forward(ctx, x, log_threshold, bandwidth):
-        ctx.save_for_backward(x, log_threshold, torch.tensor(bandwidth))
-        threshold = torch.exp(log_threshold)
-        return x * (x > threshold).float()
+    def forward(ctx, x, threshold, bandwidth: float):
+        ctx.save_for_backward(x, threshold)
+        ctx.bandwidth = float(bandwidth)
+        return x * (x > threshold).to(x.dtype)
     
     @staticmethod
     def backward(ctx, grad_output):
-        x, log_threshold, bandwidth_tensor = ctx.saved_tensors
-        bandwidth = bandwidth_tensor.item()
-        threshold = torch.exp(log_threshold)
+        x, threshold = ctx.saved_tensors
+        bw = ctx.bandwidth
         
         # Gradient w.r.t. x: pass through for active units
-        x_grad = (x > threshold).float() * grad_output
+        x_grad = (x > threshold).to(grad_output.dtype) * grad_output
         
-        # Gradient w.r.t. log_threshold: encourage threshold to capture/release activations
-        # Multiply by threshold for log-scale gradient (chain rule: d/d(log_t) = t * d/dt)
-        threshold_grad = (
-            -(threshold / bandwidth)
-            * RectangleFunction.apply((x - threshold) / bandwidth)
-            * grad_output
-        )
+        # Gradient w.r.t. threshold (∂L/∂θ)
+        # Paper's pseudo-derivative: ∂_θ JumpReLU_θ(z) = -θ/ε * K((z-θ)/ε)
+        # Autodiff will multiply by θ through exp(log_threshold) to get ∂L/∂log_θ
+        rect = (((x - threshold) / bw > -0.5) & ((x - threshold) / bw < 0.5)).to(grad_output.dtype)
+        threshold_grad = -(threshold / bw) * rect * grad_output
         
         return x_grad, threshold_grad, None  # None for bandwidth
 
@@ -155,8 +151,8 @@ class JumpReLU(nn.Module):
     def __init__(
         self, 
         feature_size: int, 
-        bandwidth: float = 0.01, 
-        initial_threshold: float = 1.0,
+        bandwidth: float = 0.001, 
+        initial_threshold: float = 0.001,
         device: str | torch.device = 'cpu'
     ):
         super(JumpReLU, self).__init__()
@@ -175,7 +171,10 @@ class JumpReLU(nn.Module):
         Returns:
             Output tensor of same shape with JumpReLU applied
         """
-        return JumpReLUFunction.apply(x, self.log_threshold, self.bandwidth)
+        # Compute threshold outside the autograd function so autodiff
+        # handles the chain rule through exp(log_threshold) correctly
+        threshold = torch.exp(self.log_threshold)
+        return JumpReLUFunction.apply(x, threshold, self.bandwidth)
     
     @property
     def threshold(self) -> torch.Tensor:

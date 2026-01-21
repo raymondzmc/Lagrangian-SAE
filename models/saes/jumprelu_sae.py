@@ -30,6 +30,7 @@ class JumpReLUSAEConfig(SAEConfig):
     sae_type: SAEType = Field(default=SAEType.JUMP_RELU, description="Type of SAE (automatically set to jump_relu)")
     target_l0: float = Field(..., description="Target L0 sparsity (number of active features per sample)")
     bandwidth: float = Field(0.01, description="Bandwidth for JumpReLU gradient approximation")
+    initial_threshold: float = Field(0.001, description="Initial threshold for JumpReLU activation")
     use_pre_enc_bias: bool = Field(False, description="Whether to subtract decoder bias before encoding")
     tied_encoder_init: bool = Field(True, description="Initialize encoder as decoder.T")
     
@@ -70,7 +71,8 @@ class JumpReLUSAE(BaseSAE):
         input_size: int,
         n_dict_components: int,
         target_l0: float,
-        bandwidth: float = 0.01,
+        bandwidth: float = 0.001,
+        initial_threshold: float = 0.001,
         use_pre_enc_bias: bool = False,
         sparsity_coeff: float | None = None,  # Coefficient for target L0 loss
         mse_coeff: float | None = None,
@@ -86,6 +88,7 @@ class JumpReLUSAE(BaseSAE):
             n_dict_components: Number of dictionary features.
             target_l0: Target L0 sparsity (number of active features per sample).
             bandwidth: Bandwidth for JumpReLU gradient approximation.
+            initial_threshold: Initial threshold for JumpReLU activation.
             use_pre_enc_bias: Whether to subtract decoder bias before encoding.
             sparsity_coeff: Coefficient for target L0 regularization loss.
             mse_coeff: Coefficient on MSE reconstruction loss.
@@ -103,6 +106,7 @@ class JumpReLUSAE(BaseSAE):
         self.n_dict_components = n_dict_components
         self.target_l0 = target_l0
         self.bandwidth = bandwidth
+        self.initial_threshold = initial_threshold
         self.use_pre_enc_bias = use_pre_enc_bias
         
         # Loss coefficients
@@ -126,7 +130,7 @@ class JumpReLUSAE(BaseSAE):
         self.jumprelu = JumpReLU(
             feature_size=n_dict_components,
             bandwidth=bandwidth,
-            device='cpu'  # Will be moved with the model
+            initial_threshold=initial_threshold
         )
         
         # Initialize decoder, then (optionally) tie encoder init
@@ -181,9 +185,12 @@ class JumpReLUSAE(BaseSAE):
         x_reconstruct = F.linear(feature_activations, self.dict_elements) + self.decoder_bias
         
         # Compute L0 for loss
+        # Compute threshold outside the autograd function so autodiff
+        # handles the chain rule through exp(log_threshold) correctly
+        threshold = torch.exp(self.jumprelu.log_threshold)
         l0 = StepFunction.apply(
             pre_activations, 
-            self.jumprelu.log_threshold, 
+            threshold,
             self.bandwidth
         ).sum(dim=-1)
         
@@ -220,7 +227,6 @@ class JumpReLUSAE(BaseSAE):
             "mse_loss": mse_loss.detach().clone(),
             "sparsity_loss": sparsity_loss.detach().clone(),
             "l0_norm": mean_l0.detach().clone(),
-            "target_l0": torch.tensor(self.target_l0),
         }
         
         # Optional auxiliary dead-feature loss using residual reconstruction

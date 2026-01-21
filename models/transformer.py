@@ -63,6 +63,8 @@ class SAETransformer(torch.nn.Module):
         """Create SAE modules with proper device context."""
         sae_config = self.sae_config
         device = self.device or self.tlens_model.cfg.device
+        # Get dtype from the model to ensure SAEs use the same precision
+        dtype = self.tlens_model.cfg.dtype
         
         # Get the SAE class from the mapping
         sae_cls = SAE_TYPE_TO_CLS.get(sae_config.sae_type)
@@ -77,7 +79,13 @@ class SAETransformer(torch.nn.Module):
             
             # Add the required parameters first
             config_dict['input_size'] = input_size
-            config_dict['n_dict_components'] = int(sae_config.dict_size_to_input_ratio * input_size)
+            # Use explicit n_dict_components if set, otherwise compute from ratio
+            if sae_config.n_dict_components is not None:
+                config_dict['n_dict_components'] = sae_config.n_dict_components
+            elif sae_config.dict_size_to_input_ratio is not None:
+                config_dict['n_dict_components'] = int(sae_config.dict_size_to_input_ratio * input_size)
+            else:
+                raise ValueError("Either n_dict_components or dict_size_to_input_ratio must be set")
             
             # Get the constructor signature to filter parameters
             constructor_sig = inspect.signature(sae_cls.__init__)
@@ -89,8 +97,13 @@ class SAETransformer(torch.nn.Module):
                 if key in constructor_params
             }
             
-            # Create and move SAE to device
-            self.saes[self.all_sae_positions[i]] = sae_cls(**filtered_config_dict).to(device)
+            # Create SAE and move to device with same dtype as model
+            sae = sae_cls(**filtered_config_dict)
+            if dtype is not None:
+                sae = sae.to(device=device, dtype=dtype)
+            else:
+                sae = sae.to(device=device)
+            self.saes[self.all_sae_positions[i]] = sae
 
     def forward(
         self,

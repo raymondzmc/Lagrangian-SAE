@@ -1,18 +1,19 @@
 # Experiment Settings
-wandb_project: gpt2-small
+wandb_project: gemma2-2b
 wandb_run_name: lagrangian
 wandb_tags: ["lagrangian"]
 seed: 42
 
 # Model Configuration  
-tlens_model_name: "gpt2-small" 
+tlens_model_name: "google/gemma-2-2b"
 tlens_model_path: null
+dtype: bfloat16
 
 # Training Configuration
 save_every_n_samples: null
 eval_every_n_samples: 40_000
 gradient_accumulation_steps: 1
-lr: 5e-4
+lr: 3e-4
 lr_schedule: cosine
 min_lr_factor: 0.1
 warmup_samples: 20_000
@@ -21,13 +22,13 @@ log_every_n_grad_steps: 20
 
 # Data Configuration
 data:
-  dataset_name: "apollo-research/Skylion007-openwebtext-tokenizer-gpt2"
-  tokenizer_name: "gpt2"
+  dataset_name: "chanind/pile-uncopyrighted-gemma-1024-abbrv-1B"
+  tokenizer_name: "google/gemma-2-2b"
   context_length: 1024
-  n_train_samples: 300_000
+  n_train_samples: 500_000
   n_eval_samples: 1_000
   train_batch_size: 8
-  eval_batch_size: 8
+  eval_batch_size: 1
   streaming: true
   seed: null
   is_tokenized: true
@@ -35,19 +36,15 @@ data:
   split: "train"
 
 # SAE Configuration - Lagrangian SAE with dual ascent sparsity control
-# Target L0 = 32 to match TopK/BatchTopK experiments with k=32
 saes:
   name: "lagrangian_sae"
   sae_type: "lagrangian"
-  dict_size_to_input_ratio: 32.0
+  dict_size_to_input_ratio: null
+  n_dict_components: 16384
   pretrained_sae_paths: null
   retrain_saes: false
   sae_positions:
-    - blocks.2.hook_resid_pre
-    - blocks.4.hook_resid_pre
-    - blocks.6.hook_resid_pre
-    - blocks.8.hook_resid_pre
-    - blocks.10.hook_resid_pre
+    - blocks.12.hook_resid_pre
   init_decoder_orthogonal: true
   sparsity_coeff: null
   mse_coeff: 1.0
@@ -56,13 +53,13 @@ saes:
   initial_alpha: 0.0  # Initial Lagrangian multiplier (>= 0)
   alpha_lr: 0.01  # Learning rate for dual ascent
   alpha_lr_down: null  # If None, uses 0.1 * alpha_lr for slower descent
-  alpha_max: 1.0  # Maximum alpha (no normalization, so keep small)
-  l0_ema_momentum: 0.99  # Momentum for running mean of L0 (higher = smoother)
-  rho_quadratic: 0.001  # Quadratic penalty coefficient (no normalization, so keep small)
+  alpha_max: 1.0  # Maximum alpha
+  l0_ema_momentum: 0.99  # Momentum for running mean of L0
+  rho_quadratic: 0.001  # Quadratic penalty coefficient
   # Per-feature learned threshold parameters (like JumpReLU)
   initial_threshold: 0.001  # Fallback threshold if calibration is disabled
-  bandwidth: 0.001  # Bandwidth for gradient approximation (larger = more gradient signal to thresholds)
-  # Threshold calibration (RECOMMENDED: auto-sets thresholds so initial L0 ≈ target_l0)
+  bandwidth: 0.001  # Bandwidth for gradient approximation
+  # Threshold calibration (auto-sets thresholds so initial L0 ≈ target_l0)
   calibrate_thresholds: true
   # Constraint type: true = equality (L0 ≈ target), false = inequality (L0 ≤ target)
   equality_constraint: true
@@ -71,6 +68,5 @@ saes:
   normalize_input: true
   # Dead feature tracking and auxiliary loss
   dead_toks_threshold: 10_000_000
-  aux_k: 512  # Number of auxiliary features from dead latents (same as TopK/BatchTopK)
-  aux_coeff: 0.03125  # Coefficient for auxiliary reconstruction loss
-
+  aux_k: 512
+  aux_coeff: 0.03125

@@ -183,7 +183,7 @@ class BatchTopKSAE(BaseSAE):
         
         # Reshape back to original shape
         acts_topk = acts_topk_flat.reshape(acts.shape)
-        mask = (acts_topk > 0).float()
+        mask = (acts_topk > 0).to(acts.dtype)
         
         return acts_topk, mask
 
@@ -218,7 +218,7 @@ class BatchTopKSAE(BaseSAE):
         """
         # Convert threshold to acts dtype for comparison
         threshold = self.running_threshold.to(acts.dtype)
-        mask = (acts > threshold).float()
+        mask = (acts > threshold).to(acts.dtype)
         acts_sparse = acts * mask
         return acts_sparse, mask
 

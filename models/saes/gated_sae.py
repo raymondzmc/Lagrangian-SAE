@@ -84,7 +84,7 @@ class GatedSAE(BaseSAE):
 
         # Gating network: simple bias addition (no scaling)
         pi_gate = x_enc + self.gate_bias
-        f_gate = (pi_gate > 0).float()  # Heaviside step -> {0,1}
+        f_gate = (pi_gate > 0).to(x.dtype)  # Heaviside step -> {0,1}
 
         # Magnitude network: exponential scaling + bias + ReLU
         pi_mag = self.r_mag.exp() * x_enc + self.mag_bias

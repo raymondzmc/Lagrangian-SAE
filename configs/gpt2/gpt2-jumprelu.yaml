@@ -51,6 +51,7 @@ saes:
   # JumpReLU specific parameters
   target_l0: 32.0  # Target L0 sparsity (number of active features per sample)
   bandwidth: 0.001
+  initial_threshold: 0.001
   use_pre_enc_bias: true
   tied_encoder_init: true
   # L0 regularization coefficient

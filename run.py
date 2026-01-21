@@ -320,7 +320,10 @@ def run(config_path_or_obj: Path | str | Config, device: torch.device | None = N
         mini_batch_size=config.mini_batch_size,
     )
     tlens_model = load_tlens_model(
-        tlens_model_name=config.tlens_model_name, tlens_model_path=config.tlens_model_path, device=device
+        tlens_model_name=config.tlens_model_name, 
+        tlens_model_path=config.tlens_model_path, 
+        device=device,
+        dtype=config.dtype,
     )
 
     cache_positions: list[str] | None = None
@@ -400,6 +403,7 @@ if __name__ == "__main__":
     
     print(f"Running training with config: {config_path}")
     print(f"SAE type: {config.saes.sae_type}")
+    print(f"Dtype: {config.dtype}")
     print(f"Wandb project: {config.wandb_project}")
 
     # Run training

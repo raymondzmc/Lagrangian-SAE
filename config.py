@@ -36,6 +36,10 @@ class Config(BaseModel):
         None,
         description="Path to '.pt' checkpoint. The directory housing this file should also contain `CONFIG_FILE`."
     )
+    dtype: Literal["float32", "float16", "bfloat16"] = Field(
+        "float32",
+        description="Data type for model and SAE training. Use 'bfloat16' for larger models like Gemma-2."
+    )
     save_dir: Path | None = settings.output_dir
 
     save_every_n_samples: PositiveInt | None = None

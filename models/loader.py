@@ -1,4 +1,6 @@
 from pathlib import Path
+import warnings
+import logging
 
 import torch
 import yaml
@@ -6,14 +8,48 @@ from transformer_lens import HookedTransformer, HookedTransformerConfig
 from utils.types import convert_str_to_torch_dtype
 from utils.constants import CONFIG_FILE
 
+# Suppress HuggingFace deprecation warning about torch_dtype (comes via logging)
+logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
+
 
 def load_tlens_model(
-    tlens_model_name: str | None, tlens_model_path: Path | None, device: torch.device | None = None
+    tlens_model_name: str | None, 
+    tlens_model_path: Path | None, 
+    device: torch.device | None = None,
+    dtype: torch.dtype | str | None = None,
 ) -> HookedTransformer:
-    """Load transformerlens model from either HuggingFace or local path."""
+    """Load transformerlens model from either HuggingFace or local path.
+    
+    Args:
+        tlens_model_name: Name of the model to load from HuggingFace (e.g., "google/gemma-2-2b").
+        tlens_model_path: Path to a local model checkpoint.
+        device: Device to load the model to.
+        dtype: Data type for the model (e.g., torch.bfloat16 or "bfloat16").
+    
+    Returns:
+        The loaded HookedTransformer model.
+    """
+    # Convert string dtype to torch dtype if needed
+    if isinstance(dtype, str):
+        dtype = convert_str_to_torch_dtype(dtype)
+    
     if tlens_model_name is not None:
         # Load to CPU first to avoid default cuda:0 allocation
-        tlens_model = HookedTransformer.from_pretrained(tlens_model_name, device="cpu")
+        # Use from_pretrained_no_processing for reduced precision to avoid warning
+        is_reduced_precision = dtype in (torch.bfloat16, torch.float16)
+        if is_reduced_precision:
+            tlens_model = HookedTransformer.from_pretrained_no_processing(
+                tlens_model_name, 
+                device="cpu",
+                dtype=dtype,
+            )
+        else:
+            tlens_model = HookedTransformer.from_pretrained(
+                tlens_model_name, 
+                device="cpu",
+                dtype=dtype,
+            )
         # Then move to target device if specified
         if device is not None:
             tlens_model = tlens_model.to(device)

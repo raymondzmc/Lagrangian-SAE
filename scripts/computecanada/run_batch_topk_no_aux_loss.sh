@@ -16,5 +16,5 @@ source ~/venvs/sae/bin/activate
 
 
 python run_sweep.py \
---base_config configs/gpt2/gpt2-batch_topk_no_aux_loss.yaml \
+--base_config configs/gpt2/gpt2-batchtopk.yaml \
 --sweep_config configs/gpt2/sweep/topk_sweep.yaml

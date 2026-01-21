@@ -10,7 +10,11 @@ class SAEConfig(BaseModel):
     name: str
     model_config = ConfigDict(extra="ignore", frozen=False)
     sae_type: SAEType = Field(..., description="Type of SAE to use")
-    dict_size_to_input_ratio: PositiveFloat = 1.0
+    dict_size_to_input_ratio: PositiveFloat | None = Field(
+        32.0, 
+        description="Ratio of dictionary size to input size. Can be None if n_dict_components is explicitly set."
+    )
+    n_dict_components: int | None = Field(None, description="Number of dictionary components. If None, will be set to dict_size_to_input_ratio * input_size")
     pretrained_sae_paths: Annotated[
         list[Path] | None, BeforeValidator(lambda x: [x] if isinstance(x, (str, Path)) else x)
     ] = Field(None, description="Path to a pretrained SAEs to load. If None, don't load any.")

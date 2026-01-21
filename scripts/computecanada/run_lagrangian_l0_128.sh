@@ -5,7 +5,7 @@
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:h100:1
 #SBATCH --constraint=h100
-#SBATCH --job-name=lagrangian_l0_128
+#SBATCH --job-name=lagrangian_l0_128_0
 
 module load StdEnv/2023
 module load python/3.12.4

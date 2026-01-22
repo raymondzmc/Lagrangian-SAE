@@ -248,9 +248,9 @@ class LagrangianSAE(BaseSAE):
         self.register_buffer("stats_last_nonzero", torch.zeros(n_dict_components, dtype=torch.long))
         
         # Running statistics for input normalization (if enabled)
+        # Uses scale-only normalization: x_norm = x / scale to achieve mean squared L2 norm ≈ 1
         if self.normalize_input:
-            self.register_buffer("running_input_mean", torch.zeros(input_size))
-            self.register_buffer("running_input_var", torch.ones(input_size))
+            self.register_buffer("running_msn", torch.tensor(1.0))  # mean squared norm
             self.register_buffer("input_stats_initialized", torch.tensor(False))
         
         # Threshold calibration state
@@ -305,62 +305,50 @@ class LagrangianSAE(BaseSAE):
               f"min={min_threshold:.4f}, max={max_threshold:.4f}, "
               f"target_percentile={target_percentile:.6f}")
 
-    def _normalize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _normalize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Normalize input to have approximately unit variance.
+        Scale-only normalization to achieve mean squared L2 norm ≈ 1.
         
-        Uses running statistics during training, frozen statistics during eval.
-        Returns the normalized input, scale (std), and shift (mean) for denormalization.
+        Computes: x_normalized = x / scale, where scale = sqrt(E[||x||²/d])
+        This preserves the mean/direction of activations while ensuring E[||x||²/d] ≈ 1.
         
-        The SAE operates in normalized space for consistent threshold behavior across layers.
-        Reconstruction is computed in normalized space, then denormalized for the output.
+        Returns the normalized input and scale factor for denormalization.
         """
-        # Flatten to (N, input_size) for statistics computation
-        x_flat = x.reshape(-1, self.input_size)
+        # Compute mean squared norm: E[||x||²/d] = mean of all squared elements
+        batch_msn = (x ** 2).mean()
         
         if self.training:
-            # Compute batch statistics
-            batch_mean = x_flat.mean(dim=0)
-            batch_var = x_flat.var(dim=0, unbiased=False)
-            
             with torch.no_grad():
                 if not self.input_stats_initialized:
-                    # Initialize with first batch
-                    self.running_input_mean.copy_(batch_mean)
-                    self.running_input_var.copy_(batch_var)
+                    self.running_msn.copy_(batch_msn)
                     self.input_stats_initialized.fill_(True)
                 else:
-                    # EMA update (using same momentum as L0 EMA)
+                    # EMA update
                     momentum = self.l0_ema_momentum
-                    self.running_input_mean.mul_(momentum).add_((1 - momentum) * batch_mean)
-                    self.running_input_var.mul_(momentum).add_((1 - momentum) * batch_var)
+                    self.running_msn.mul_(momentum).add_((1 - momentum) * batch_msn)
         
-        # Use running statistics for normalization
-        std = (self.running_input_var + 1e-8).sqrt()
-        mean = self.running_input_mean
+        # Scale factor: sqrt(running_msn)
+        scale = (self.running_msn + 1e-8).sqrt()
+        x_normalized = x / scale
         
-        # Normalize: subtract mean, divide by std
-        x_normalized = (x - mean) / std
-        
-        return x_normalized, std, mean
+        return x_normalized, scale
 
     def forward(self, x: Float[torch.Tensor, "... dim"]) -> LagrangianSAEOutput:
         """
         Forward pass (supports arbitrary leading batch dims; last dim == input_size).
         
         If normalize_input is enabled:
-        - Input is normalized to approximately zero mean and unit variance
-        - SAE operates entirely in normalized space (encoding, thresholding, decoding)
+        - Input is scaled to achieve mean squared L2 norm ≈ 1 (preserves mean/direction)
+        - SAE operates in normalized space (encoding, thresholding, decoding)
         - Output is denormalized back to original scale
         - MSE loss is computed in original space for proper comparison
         """
-        # Optional: normalize input to unit variance (helps with layer-wise scale differences)
+        # Optional: scale-only normalization to achieve mean squared L2 norm ≈ 1
         if self.normalize_input:
-            x_normalized, input_std, input_mean = self._normalize_input(x)
+            x_normalized, input_scale = self._normalize_input(x)
         else:
             x_normalized = x
-            input_std = None
-            input_mean = None
+            input_scale = None
         
         # Optional: subtract decoder bias before encoding
         if self.use_pre_enc_bias:
@@ -399,9 +387,9 @@ class LagrangianSAE(BaseSAE):
         # Decode using normalized dictionary elements + add bias back (in normalized space)
         x_hat_normalized = F.linear(c, self.dict_elements, bias=self.decoder_bias)
         
-        # Denormalize output back to original scale
-        if self.normalize_input and input_std is not None and input_mean is not None:
-            x_hat = x_hat_normalized * input_std + input_mean
+        # Denormalize output back to original scale (scale-only: just multiply)
+        if self.normalize_input and input_scale is not None:
+            x_hat = x_hat_normalized * input_scale
         else:
             x_hat = x_hat_normalized
 

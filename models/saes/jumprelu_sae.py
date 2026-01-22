@@ -1,12 +1,13 @@
 # jumprelu_sae.py
 """
-JumpReLU SAE implementation consistent with the original paper.
+JumpReLU SAE implementation.
 
-Key paper-consistent behaviors:
-1. Reconstruction loss: SSE per example (sum over dims), then batch mean
+Key behaviors:
+1. Reconstruction loss: MSE (mean over batch and dims) - matches other SAE types
 2. Sparsity loss: Per-example L0 penalty, then batch mean  
 3. ReLU on pre-activations before JumpReLU (as paper recommends)
 4. Log-threshold parameterization for positive thresholds
+5. Scale-only input normalization (optional) for consistent bandwidth behavior
 
 Reference: "Scaling and evaluating sparse autoencoders" (Gao et al.)
 """
@@ -30,10 +31,10 @@ from utils.enums import SAEType
 
 class JumpReLUSAEConfig(SAEConfig):
     """
-    Config for JumpReLU SAE (paper-consistent implementation).
+    Config for JumpReLU SAE.
     
-    Loss formulation (matching paper):
-    - Reconstruction: E_x[ sum_d (x_d - x̂_d)² ]  (SSE per example, batch mean)
+    Loss formulation:
+    - Reconstruction: MSE (mean over batch and dims) - matches other SAE types
     - Sparsity: E_x[ λ · (L0(x) / target_l0 - 1)² ]  (per-example penalty, batch mean)
     
     Notes:
@@ -275,17 +276,15 @@ class JumpReLUSAE(BaseSAE):
     
     def compute_loss(self, output: JumpReLUSAEOutput) -> SAELoss:
         """
-        Paper-consistent loss computation:
+        Loss computation:
         
-        Loss = mse_coeff * E_x[sum_d (x_d - x̂_d)²] + sparsity_coeff * E_x[(L0/target - 1)²]
+        Loss = mse_coeff * MSE + sparsity_coeff * E_x[(L0/target - 1)²]
         
-        - Reconstruction: SSE per example (sum over dims), then batch mean
+        - Reconstruction: MSE (mean over batch and dims) - matches other SAE types
         - Sparsity: Per-example L0 penalty, then batch mean
         """
-        # Reconstruction loss: SSE per example, then batch mean (paper formulation)
-        reconstruction_error = (output.output - output.input) ** 2
-        flat_error = reconstruction_error.reshape(-1, self.input_size)
-        reconstruction_loss = flat_error.sum(dim=-1).mean()
+        # Reconstruction loss: MSE (matches TopK, ReLU, Lagrangian SAEs)
+        reconstruction_loss = F.mse_loss(output.output, output.input)
         
         # Sparsity loss: per-example penalty, then batch mean (paper formulation)
         per_example_penalty = ((output.l0 / self.target_l0) - 1.0) ** 2

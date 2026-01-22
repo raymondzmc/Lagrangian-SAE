@@ -1,11 +1,11 @@
 # Experiment Settings
-wandb_project: gemma2-2b
-wandb_run_name: topk
-wandb_tags: ["topk"]
+wandb_project: gemma2-2b-50M
+wandb_run_name: batch_topk
+wandb_tags: ["batch_topk"]
 seed: 42
 
 # Model Configuration  
-tlens_model_name: "google/gemma-2-2b"
+tlens_model_name: "google/gemma-2-2b" 
 tlens_model_path: null
 dtype: bfloat16
 
@@ -25,20 +25,20 @@ data:
   dataset_name: "chanind/pile-uncopyrighted-gemma-1024-abbrv-1B"
   tokenizer_name: "google/gemma-2-2b"
   context_length: 1024
-  n_train_samples: 500_000
+  n_train_samples: 50_000
   n_eval_samples: 1_000
   train_batch_size: 8
-  eval_batch_size: 1
+  eval_batch_size: 8
   streaming: true
   seed: null
   is_tokenized: true
   column_name: "input_ids"
   split: "train"
 
-# SAE Configuration - Hard Concrete SAE with learned gates
+# SAE Configuration - Batch Top-K SAE
 saes:
-  name: "topk_sae"
-  sae_type: "topk"
+  name: "batch_topk_sae"
+  sae_type: "batch_topk"
   dict_size_to_input_ratio: null
   n_dict_components: 16384
   pretrained_sae_paths: null
@@ -49,6 +49,9 @@ saes:
   sparsity_coeff: null
   k: 32
   tied_encoder_init: true
+  # Auxiliary loss parameters for dead feature mitigation
   aux_k: 512
   aux_coeff: 0.03125
   dead_toks_threshold: 10_000_000
+  # Input preprocessing
+  input_unit_norm: false

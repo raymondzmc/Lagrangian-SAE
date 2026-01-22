@@ -1,7 +1,7 @@
 # Experiment Settings
-wandb_project: gemma2-2b
-wandb_run_name: matryoshka
-wandb_tags: ["matryoshka"]
+wandb_project: gemma2-2b-50M
+wandb_run_name: topk
+wandb_tags: ["topk"]
 seed: 42
 
 # Model Configuration  
@@ -25,20 +25,20 @@ data:
   dataset_name: "chanind/pile-uncopyrighted-gemma-1024-abbrv-1B"
   tokenizer_name: "google/gemma-2-2b"
   context_length: 1024
-  n_train_samples: 500_000
+  n_train_samples: 50_000
   n_eval_samples: 1_000
   train_batch_size: 8
-  eval_batch_size: 1
+  eval_batch_size: 8
   streaming: true
   seed: null
   is_tokenized: true
   column_name: "input_ids"
   split: "train"
 
-# SAE Configuration - Matryoshka Batch Top-K SAE
+# SAE Configuration - Hard Concrete SAE with learned gates
 saes:
-  name: "matryoshka_sae"
-  sae_type: "matryoshka"
+  name: "topk_sae"
+  sae_type: "topk"
   dict_size_to_input_ratio: null
   n_dict_components: 16384
   pretrained_sae_paths: null
@@ -47,14 +47,8 @@ saes:
     - blocks.12.hook_resid_pre
   init_decoder_orthogonal: true
   sparsity_coeff: null
-  # Matryoshka-specific parameters
   k: 32
-  # group_fractions defaults to [1/32, 1/16, 1/8, 1/4, 1/2 + 1/32] (5 groups)
-  # group_weights defaults to uniform
   tied_encoder_init: true
-  # Auxiliary loss parameters for dead feature mitigation
   aux_k: 512
   aux_coeff: 0.03125
   dead_toks_threshold: 10_000_000
-  # Input preprocessing
-  input_unit_norm: false

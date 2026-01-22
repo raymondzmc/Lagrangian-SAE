@@ -333,10 +333,11 @@ def create_dataloaders(
         
         eval_loader = None
         if eval_torch_dataset is not None and data_config.n_eval_samples is not None:
-            expected_eval_batches = math.ceil(data_config.n_eval_samples / data_config.eval_batch_size)
+            eval_bs = data_config.effective_eval_batch_size
+            expected_eval_batches = math.ceil(data_config.n_eval_samples / eval_bs)
             eval_loader = StreamingDataLoader(
                 eval_torch_dataset,
-                batch_size=data_config.eval_batch_size,
+                batch_size=eval_bs,
                 shuffle=False,
                 expected_length=expected_eval_batches,
             )

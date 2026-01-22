@@ -237,6 +237,9 @@ def train(
                 ))
 
                 if is_eval_step and eval_loader is not None:
+                    # Clear GPU cache to avoid OOM from memory fragmentation
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
                     eval_metrics = evaluate(
                         config=config, model=model, eval_loader=eval_loader, device=device, cache_positions=cache_positions
                     )

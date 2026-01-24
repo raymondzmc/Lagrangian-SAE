@@ -156,9 +156,10 @@ class SAETransformer(torch.nn.Module):
                         loss_outputs[position] = loss_output
 
                     if modify_output:
-                        # Use SAE reconstructed activations
-                        activation_cache[position] = sae_output.output.detach().clone()
-                        return sae_output.output
+                        # Use SAE reconstructed activations (use output_raw for JumpReLU with normalization)
+                        raw_output = getattr(sae_output, 'output_raw', sae_output.output)
+                        activation_cache[position] = raw_output.detach().clone()
+                        return raw_output
                 return x
             return hook_fn
 

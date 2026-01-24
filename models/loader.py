@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 import warnings
 import logging
 
@@ -7,10 +8,22 @@ import yaml
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from utils.types import convert_str_to_torch_dtype
 from utils.constants import CONFIG_FILE
+from utils.logging import logger
 
 # Suppress HuggingFace deprecation warning about torch_dtype (comes via logging)
 logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message=".*torch_dtype.*is deprecated.*")
+
+
+def is_flash_attention_available() -> bool:
+    """Check if flash attention is available via PyTorch SDPA.
+    
+    Returns:
+        True if flash attention is available, False otherwise.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.backends.cuda.flash_sdp_enabled()
 
 
 def load_tlens_model(
@@ -18,6 +31,8 @@ def load_tlens_model(
     tlens_model_path: Path | None, 
     device: torch.device | None = None,
     dtype: torch.dtype | str | None = None,
+    use_torch_compile: bool = False,
+    torch_compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "reduce-overhead",
 ) -> HookedTransformer:
     """Load transformerlens model from either HuggingFace or local path.
     
@@ -26,6 +41,9 @@ def load_tlens_model(
         tlens_model_path: Path to a local model checkpoint.
         device: Device to load the model to.
         dtype: Data type for the model (e.g., torch.bfloat16 or "bfloat16").
+        use_torch_compile: Whether to compile the model with torch.compile for optimization.
+            This enables PyTorch's inductor backend which can use flash attention.
+        torch_compile_mode: The compilation mode for torch.compile.
     
     Returns:
         The loaded HookedTransformer model.
@@ -76,6 +94,19 @@ def load_tlens_model(
             tlens_model = tlens_model.to(device)
 
     assert tlens_model.tokenizer is not None
+    
+    # Apply torch.compile if requested
+    if use_torch_compile:
+        flash_available = is_flash_attention_available()
+        logger.info(
+            f"Applying torch.compile with mode='{torch_compile_mode}' "
+            f"(flash attention available: {flash_available})"
+        )
+        # Set float32 matmul precision for better performance
+        torch.set_float32_matmul_precision('high')
+        tlens_model = torch.compile(tlens_model, mode=torch_compile_mode)
+        logger.info("Model compiled successfully. First forward pass will be slower due to compilation.")
+    
     return tlens_model
 
 

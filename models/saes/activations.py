@@ -4,7 +4,7 @@ Shared activation functions and autograd primitives for SAEs.
 
 Contains:
 - RectangleFunction: Rectangle function with custom gradient (used in differentiable L0)
-- StepFunction: Step function for L0 with gradient to learned log-thresholds
+- StepFunction: Step function for L0 with gradient to learned thresholds
 - JumpReLUFunction: JumpReLU activation with learned thresholds
 - JumpReLU: nn.Module wrapper for JumpReLU activation
 """
@@ -64,12 +64,10 @@ class StepFunction(autograd.Function):
     
     Forward: H(x - threshold) = 1 if x > threshold, else 0
     Backward: Gradient only flows to threshold (not to x).
-              Returns gradient w.r.t. threshold (θ), not log_threshold.
-              Autodiff handles chain rule through exp(log_threshold) outside.
     
     Args:
-        x: Pre-activations (after ReLU)
-        threshold: Threshold value (computed as exp(log_threshold) outside this function)
+        x: Pre-activations (raw encoder outputs, can be negative)
+        threshold: Threshold value (raw, not log-space)
         bandwidth: Controls gradient width (smaller = sharper gradient)
     """
     
@@ -88,8 +86,6 @@ class StepFunction(autograd.Function):
         x_grad = torch.zeros_like(x)
         
         # Gradient w.r.t. threshold (∂L/∂θ)
-        # Paper's pseudo-derivative for Heaviside: ∂_θ H(z-θ) = -1/ε * K((z-θ)/ε)
-        # Autodiff will multiply by θ through exp(log_threshold) to get ∂L/∂log_θ
         rect = (((x - threshold) / bw > -0.5) & ((x - threshold) / bw < 0.5)).to(grad_output.dtype)
         threshold_grad = -(1.0 / bw) * rect * grad_output
         
@@ -102,13 +98,12 @@ class JumpReLUFunction(autograd.Function):
     Forward: x * (x > threshold)
              Returns x if x > threshold, else 0 (hard sparsity)
     
-    Backward: Gradient flows through for active units (x > threshold)
-              Returns gradient w.r.t. threshold (θ), not log_threshold.
-              Autodiff handles chain rule through exp(log_threshold) outside.
+    Backward: Gradient flows through for active units (x > threshold).
+              Gradient also flows to threshold parameter.
     
     Args:
-        x: Pre-activations (after ReLU)
-        threshold: Threshold value (computed as exp(log_threshold) outside this function)
+        x: Pre-activations (raw encoder outputs, can be negative)
+        threshold: Threshold value (raw, not log-space)
         bandwidth: Controls gradient width for threshold learning
     """
     
@@ -127,8 +122,6 @@ class JumpReLUFunction(autograd.Function):
         x_grad = (x > threshold).to(grad_output.dtype) * grad_output
         
         # Gradient w.r.t. threshold (∂L/∂θ)
-        # Paper's pseudo-derivative: ∂_θ JumpReLU_θ(z) = -θ/ε * K((z-θ)/ε)
-        # Autodiff will multiply by θ through exp(log_threshold) to get ∂L/∂log_θ
         rect = (((x - threshold) / bw > -0.5) & ((x - threshold) / bw < 0.5)).to(grad_output.dtype)
         threshold_grad = -(threshold / bw) * rect * grad_output
         
@@ -139,13 +132,13 @@ class JumpReLU(nn.Module):
     """JumpReLU activation module with learnable per-feature thresholds.
     
     Applies JumpReLU activation: x * (x > threshold) where threshold is learned.
-    The thresholds are stored in log-space for numerical stability and to ensure
-    they remain positive.
+    Uses raw threshold parameterization (not log-space) following SAE Bench.
     
     Args:
         feature_size: Number of features (dictionary components)
-        bandwidth: Controls gradient width for threshold learning (default: 0.01)
-        initial_threshold: Initial threshold value (default: 1.0, stored as log)
+        bandwidth: Controls gradient width for threshold learning (default: 0.001)
+        initial_threshold: Initial threshold value (default: 0.001)
+        device: Device to create parameters on
     """
     
     def __init__(
@@ -155,10 +148,9 @@ class JumpReLU(nn.Module):
         initial_threshold: float = 0.001,
         device: str | torch.device = 'cpu'
     ):
-        super(JumpReLU, self).__init__()
-        # Store thresholds in log-space (initialized to log(initial_threshold))
-        self.log_threshold = nn.Parameter(
-            torch.full((feature_size,), fill_value=torch.log(torch.tensor(initial_threshold)).item(), device=device)
+        super().__init__()
+        self.threshold = nn.Parameter(
+            torch.ones(feature_size, device=device) * initial_threshold
         )
         self.bandwidth = bandwidth
     
@@ -171,12 +163,4 @@ class JumpReLU(nn.Module):
         Returns:
             Output tensor of same shape with JumpReLU applied
         """
-        # Compute threshold outside the autograd function so autodiff
-        # handles the chain rule through exp(log_threshold) correctly
-        threshold = torch.exp(self.log_threshold)
-        return JumpReLUFunction.apply(x, threshold, self.bandwidth)
-    
-    @property
-    def threshold(self) -> torch.Tensor:
-        """Get current threshold values (in linear space)."""
-        return torch.exp(self.log_threshold)
+        return JumpReLUFunction.apply(x, self.threshold, self.bandwidth)

@@ -1,0 +1,5 @@
+wandb_project: "gemma2-2b-65K"
+target_l0: [64, 128, 256, 512]
+alpha_max: [5]
+equality_constraint: [true]
+n_dict_components: 65536

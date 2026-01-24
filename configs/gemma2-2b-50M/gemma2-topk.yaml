@@ -1,5 +1,5 @@
 # Experiment Settings
-wandb_project: gemma2-2b-50M
+wandb_project: gemma2-2b
 wandb_run_name: topk
 wandb_tags: ["topk"]
 seed: 42
@@ -25,7 +25,7 @@ data:
   dataset_name: "chanind/pile-uncopyrighted-gemma-1024-abbrv-1B"
   tokenizer_name: "google/gemma-2-2b"
   context_length: 1024
-  n_train_samples: 50_000
+  n_train_samples: 500_000
   n_eval_samples: 1_000
   train_batch_size: 8
   eval_batch_size: 8

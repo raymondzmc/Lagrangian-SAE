@@ -75,6 +75,11 @@ class MatryoshkaLagrangianSAEConfig(SAEConfig):
     tied_encoder_init: bool = Field(True, description="Initialize encoder as decoder.T")
     use_pre_enc_bias: bool = Field(False, description="Subtract decoder bias before encoding")
     
+    # Activation normalization (recommended for consistent behavior across layers)
+    # Uses same naming convention as JumpReLUSAE for compatibility with run.py pre-computation
+    normalize_activations: bool = Field(False, description="Normalize inputs to unit mean squared norm (recommended for stable training)")
+    norm_factor_num_batches: int = Field(100, description="Number of batches to compute norm factor over before training (dictionary_learning uses 100)")
+    
     # Dead feature tracking and auxiliary loss
     dead_toks_threshold: int | None = Field(None, description="Threshold for considering a feature as dead")
     aux_k: int | None = Field(None, description="Auxiliary K for dead-feature loss")
@@ -154,6 +159,8 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         init_decoder_orthogonal: bool = True,
         tied_encoder_init: bool = True,
         use_pre_enc_bias: bool = False,
+        normalize_activations: bool = False,
+        norm_factor_num_batches: int = 100,
     ):
         """
         Args:
@@ -180,6 +187,8 @@ class MatryoshkaLagrangianSAE(BaseSAE):
             init_decoder_orthogonal: Initialize decoder weight columns to be orthonormal.
             tied_encoder_init: Initialize encoder.weight = decoder.weight.T.
             use_pre_enc_bias: Whether to subtract decoder bias before encoding.
+            normalize_activations: Normalize inputs to unit mean squared norm (recommended for stable training).
+            norm_factor_num_batches: Number of batches to compute norm factor over before training.
         """
         super().__init__()
         assert target_l0 > 0, "target_l0 must be positive"
@@ -197,6 +206,8 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         self.bandwidth = bandwidth
         self.use_pre_enc_bias = use_pre_enc_bias
         self.equality_constraint = equality_constraint
+        self.normalize_activations = normalize_activations
+        self.norm_factor_num_batches = norm_factor_num_batches
 
         # Set default group fractions if not provided
         if group_fractions is None:
@@ -268,6 +279,13 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         # Dead latent tracking
         self.register_buffer("stats_last_nonzero", torch.zeros(n_dict_components, dtype=torch.long))
         
+        # Running statistics for activation normalization (if enabled)
+        # Uses scale-only normalization: x_norm = x / norm_factor where norm_factor = sqrt(E[||x||²])
+        # Uses same naming convention as JumpReLUSAE for compatibility with run.py pre-computation
+        if self.normalize_activations:
+            self.register_buffer("running_norm_factor", torch.tensor(1.0))
+            self.register_buffer("norm_factor_initialized", torch.tensor(False))
+        
         # Threshold calibration state
         self.calibrate_thresholds = calibrate_thresholds
         if self.calibrate_thresholds:
@@ -295,7 +313,7 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         threshold_values = sorted_preacts[percentile_idx, :]
         threshold_values = threshold_values.clamp(min=1e-4)
         
-        self.jumprelu.log_threshold.data.copy_(torch.log(threshold_values))
+        self.jumprelu.threshold.data.copy_(threshold_values)
         self.thresholds_calibrated.fill_(True)
         
         mean_threshold = threshold_values.mean().item()
@@ -304,15 +322,83 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         print(f"[MatryoshkaLagrangianSAE] Thresholds calibrated: mean={mean_threshold:.4f}, "
               f"min={min_threshold:.4f}, max={max_threshold:.4f}")
 
+    def _compute_norm_factor(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute or update the norm factor for activation normalization.
+        
+        The norm factor is sqrt(E[||x||²]) so that x/norm_factor has unit mean squared norm.
+        
+        IMPORTANT: Even when an external accumulator is refining the norm_factor over multiple
+        batches, we MUST use a reasonable estimate from the first batch. Otherwise, the
+        threshold will learn wrong values during the accumulation period (since threshold 0.001
+        is calibrated for normalized activations, not raw activations with magnitude ~50).
+        
+        This method matches JumpReLUSAE's _compute_norm_factor for compatibility with run.py.
+        
+        Args:
+            x: Input tensor with shape (..., input_size)
+            
+        Returns:
+            The norm factor to use for this forward pass
+        """
+        # Check if we've computed an initial estimate (even if not "fully initialized")
+        has_initial_estimate = getattr(self, '_has_initial_norm_estimate', False)
+        
+        if self.training and not self.norm_factor_initialized and not has_initial_estimate:
+            with torch.no_grad():
+                # Compute mean squared norm: E[||x||²]
+                # Flatten batch dimensions for computation
+                x_flat = x.reshape(-1, x.shape[-1])
+                mean_squared_norm = (x_flat ** 2).sum(dim=-1).mean()
+                norm_factor = mean_squared_norm.sqrt()
+                
+                self.running_norm_factor.copy_(norm_factor)
+                self._has_initial_norm_estimate = True
+                
+                # Only mark as fully initialized if NOT using external accumulator
+                # External accumulator will refine and mark initialized when ready
+                defer_init = getattr(self, '_defer_norm_factor_init', False)
+                if not defer_init:
+                    self.norm_factor_initialized.fill_(True)
+        
+        return self.running_norm_factor
+    
+    def set_norm_factor(self, norm_factor: float) -> None:
+        """Manually set the norm factor for activation normalization.
+        
+        This can be used to pre-compute norm_factor over multiple batches
+        (matching dictionary_learning behavior which computes it once over 100 batches).
+        
+        This method is called by run.py's compute_norm_factors_for_saes() function.
+        
+        Args:
+            norm_factor: The norm factor to use (sqrt of mean squared activation norm)
+        """
+        with torch.no_grad():
+            self.running_norm_factor.fill_(norm_factor)
+            self.norm_factor_initialized.fill_(True)
+
     def forward(self, x: Float[torch.Tensor, "... dim"]) -> MatryoshkaLagrangianSAEOutput:
         """
         Forward pass with JumpReLU activation and learned thresholds.
+        
+        If normalize_activations is enabled:
+        - Input is scaled to achieve mean squared L2 norm ≈ 1 (preserves mean/direction)
+        - SAE operates in normalized space (encoding, thresholding, decoding)
+        - Output is denormalized back to original scale
         """
+        # Activation normalization (if enabled)
+        if self.normalize_activations:
+            norm_factor = self._compute_norm_factor(x)
+            x_normalized = x / norm_factor
+        else:
+            norm_factor = None
+            x_normalized = x
+        
         # Optional: subtract decoder bias before encoding
         if self.use_pre_enc_bias:
-            x_enc = x - self.decoder_bias
+            x_enc = x_normalized - self.decoder_bias
         else:
-            x_enc = x
+            x_enc = x_normalized
 
         # Encoder with ReLU pre-activation
         preacts = F.relu(self.encoder(x_enc) + self.encoder_bias)
@@ -342,8 +428,14 @@ class MatryoshkaLagrangianSAE(BaseSAE):
             dead_toks_threshold=self.dead_toks_threshold,
         )
 
-        # Decode using normalized dictionary elements + bias
-        x_hat = F.linear(c, self.dict_elements, bias=self.decoder_bias)
+        # Decode using normalized dictionary elements + bias (in normalized space)
+        x_hat_normalized = F.linear(c, self.dict_elements, bias=self.decoder_bias)
+        
+        # Denormalize output back to original scale (scale-only: just multiply)
+        if self.normalize_activations and norm_factor is not None:
+            x_hat = x_hat_normalized * norm_factor
+        else:
+            x_hat = x_hat_normalized
 
         # Compute true L0
         l0 = (c > 0).float().sum(dim=-1)
@@ -351,7 +443,7 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         # Compute differentiable L0 using StepFunction
         l0_differentiable = StepFunction.apply(
             preacts, 
-            self.jumprelu.log_threshold, 
+            self.jumprelu.threshold, 
             self.bandwidth
         ).sum(dim=-1)
 

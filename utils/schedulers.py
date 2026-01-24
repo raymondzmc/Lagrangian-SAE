@@ -189,6 +189,47 @@ def get_exponential_beta_schedule(
     return beta_schedule
 
 
+def get_dictionary_learning_lr_schedule(
+    total_steps: int,
+    warmup_steps: int,
+    decay_start: int,
+) -> Callable[[int], float]:
+    """
+    Create a LR schedule matching dictionary_learning's approach:
+    - Linear warmup from 0 to 1 over warmup_steps
+    - Constant at 1 from warmup_steps to decay_start
+    - Linear decay from 1 to 0 from decay_start to total_steps
+    
+    This is the schedule used in dictionary_learning for JumpReLU SAE training.
+    
+    Args:
+        total_steps: Total number of training steps
+        warmup_steps: Number of steps for linear warmup
+        decay_start: Step at which to begin linear decay to 0
+        
+    Returns:
+        A function that takes a training step and returns the LR multiplier
+    """
+    assert 0 <= warmup_steps < total_steps, "warmup_steps must be >= 0 and < total_steps"
+    if decay_start is not None:
+        assert warmup_steps < decay_start < total_steps, (
+            f"decay_start ({decay_start}) must be > warmup_steps ({warmup_steps}) and < total_steps ({total_steps})"
+        )
+    
+    def lr_schedule(step: int) -> float:
+        if step < warmup_steps:
+            # Linear warmup: 0 -> 1
+            return step / warmup_steps
+        elif decay_start is not None and step >= decay_start:
+            # Linear decay: 1 -> 0
+            return (total_steps - step) / (total_steps - decay_start)
+        else:
+            # Constant phase
+            return 1.0
+    
+    return lr_schedule
+
+
 def get_sparsity_coeff_schedule(
     initial_coeff: float,
     final_coeff: float,

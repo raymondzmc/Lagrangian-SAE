@@ -86,19 +86,26 @@ def reconstruction_metrics(output: SAETransformerOutput, sae_type: SAEType) -> d
     """
     reconstruction_metrics = {}
     for name, sae_output in output.sae_outputs.items():
+        # Use raw output for metrics (for JumpReLU with normalization, output_raw is denormalized)
+        raw_output = getattr(sae_output, 'output_raw', sae_output.output)
+        # For normalized SAEs, we need the original input too
+        # Note: For JumpReLU, sae_output.input is normalized, but we want metrics in original space
+        # The activations dict has the original activations
+        original_input = output.activations.get(name, sae_output.input)
+        
         # Compute MSE loss (same as evaluation.py)
         mse = mse_loss(
-            sae_output.output,
-            sae_output.input,
+            raw_output,
+            original_input,
             reduction='mean'
         )
         
         # Fix parameter order: pred first, target second
         var = explained_variance(
-            sae_output.output, sae_output.input.detach().clone(), layer_norm_flag=False
+            raw_output, original_input.detach().clone(), layer_norm_flag=False
         )
         var_ln = explained_variance(
-            sae_output.output, sae_output.input.detach().clone(), layer_norm_flag=True
+            raw_output, original_input.detach().clone(), layer_norm_flag=True
         )
         
         # Add MSE to the metrics

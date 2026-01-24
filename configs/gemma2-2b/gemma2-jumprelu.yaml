@@ -1,0 +1,68 @@
+# Experiment Settings
+wandb_project: gemma2-2b
+wandb_run_name: jumprelu
+wandb_tags: ["jumprelu"]
+seed: 42
+
+# Model Configuration  
+tlens_model_name: "google/gemma-2-2b" 
+tlens_model_path: null
+dtype: bfloat16
+use_torch_compile: true
+torch_compile_mode: "reduce-overhead"  
+
+# Training Configuration
+save_every_n_samples: 100_000
+eval_every_n_samples: 20_000
+gradient_accumulation_steps: 1
+# Note: dictionary_learning uses lr=7e-5 for JumpReLU
+lr: 3e-4
+# Use dictionary_learning schedule: linear warmup + constant + linear decay
+lr_schedule: dictionary_learning
+decay_start_fraction: 0.8  # Start decay at 80% of training
+min_lr_factor: 0.0  # Decay to 0
+warmup_samples: 20_000
+max_grad_norm: 1.0  # SAE Bench uses 1.0
+log_every_n_grad_steps: 20
+
+# Data Configuration
+data:
+  dataset_name: "chanind/pile-uncopyrighted-gemma-1024-abbrv-1B"
+  tokenizer_name: "google/gemma-2-2b"
+  context_length: 1024
+  n_train_samples: 500_000
+  n_eval_samples: 1_000
+  train_batch_size: 8
+  eval_batch_size: 8
+  streaming: true
+  seed: null
+  is_tokenized: true
+  column_name: "input_ids"
+  split: "train"
+
+# SAE Configuration - JumpReLU SAE
+saes:
+  name: "jumprelu_sae"
+  sae_type: "jump_relu"
+  dict_size_to_input_ratio: null
+  n_dict_components: 16384
+  pretrained_sae_paths: null
+  retrain_saes: false
+  sae_positions:
+    - blocks.12.hook_resid_pre
+  init_decoder_orthogonal: true
+
+  # JumpReLU specific parameters
+  target_l0: 32.0
+  bandwidth: 0.001
+  initial_threshold: 0.001
+  use_pre_enc_bias: true
+  tied_encoder_init: true
+  normalize_activations: true
+  norm_factor_num_batches: 100  # Compute norm factor over 100 batches before training
+  sparsity_coeff: 1.0
+  mse_coeff: 1.0
+  sparsity_warmup_steps: 5000
+  dead_toks_threshold: 10_000_000
+  aux_k: 512
+  aux_coeff: 0.03125

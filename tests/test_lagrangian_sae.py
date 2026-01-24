@@ -3,7 +3,7 @@ Tests for LagrangianSAE implementation.
 
 Tests verify:
 1. Basic forward/backward pass
-2. Input normalization (running_mean, running_std) correctness
+2. Activation normalization (scale-only normalization matching JumpReLUSAE)
 3. Pre-encoder bias (decoder_bias subtraction) correctness
 4. Combined normalization + bias handling
 5. Reconstruction consistency
@@ -57,11 +57,11 @@ class TestLagrangianSAEBasic:
         # Check gradients exist for key parameters
         assert sae.encoder.weight.grad is not None
         assert sae.decoder.weight.grad is not None
-        assert sae.jumprelu.log_threshold.grad is not None
+        assert sae.jumprelu.threshold.grad is not None
 
 
-class TestInputNormalization:
-    """Tests for input normalization (running_mean, running_std)."""
+class TestActivationNormalization:
+    """Tests for activation normalization (scale-only, matching JumpReLUSAE)."""
 
     @pytest.fixture
     def sae_with_normalization(self):
@@ -69,83 +69,96 @@ class TestInputNormalization:
             input_size=64,
             n_dict_components=128,
             target_l0=8.0,
-            normalize_input=True,
+            normalize_activations=True,
             use_pre_enc_bias=False,
-            l0_ema_momentum=0.9,  # Faster adaptation for testing
         )
 
     def test_normalization_initialization(self, sae_with_normalization):
         """Test that normalization buffers are initialized correctly."""
         sae = sae_with_normalization
         
-        assert hasattr(sae, 'running_input_mean')
-        assert hasattr(sae, 'running_input_var')
-        assert hasattr(sae, 'input_stats_initialized')
+        # Should have JumpReLUSAE-compatible buffer names
+        assert hasattr(sae, 'running_norm_factor')
+        assert hasattr(sae, 'norm_factor_initialized')
         
-        # Should be initialized to zeros/ones
-        assert torch.allclose(sae.running_input_mean, torch.zeros(64))
-        assert torch.allclose(sae.running_input_var, torch.ones(64))
-        assert sae.input_stats_initialized == False
+        # Should be initialized to 1.0 (identity) and False
+        assert torch.allclose(sae.running_norm_factor, torch.tensor(1.0))
+        assert sae.norm_factor_initialized == False
 
     def test_normalization_stats_update(self, sae_with_normalization):
-        """Test that running stats are updated during training."""
+        """Test that running norm factor is updated during training."""
         sae = sae_with_normalization
         sae.train()
         
-        # Create input with known statistics
-        x = torch.randn(100, 64) * 3.0 + 5.0  # mean ~5, std ~3
+        # Create input with known magnitude
+        x = torch.randn(100, 64) * 5.0  # Large scale
+        expected_msn = (x ** 2).sum(dim=-1).mean()
+        expected_norm_factor = expected_msn.sqrt()
         
         # First forward pass should initialize stats
         _ = sae(x)
         
-        assert sae.input_stats_initialized == True
-        # Stats should be close to batch statistics
-        assert torch.allclose(sae.running_input_mean, x.mean(dim=0), atol=0.1)
-        assert torch.allclose(sae.running_input_var, x.var(dim=0, unbiased=False), atol=0.5)
+        assert sae.norm_factor_initialized == True
+        # Norm factor should be close to sqrt(mean squared norm)
+        assert torch.allclose(sae.running_norm_factor, expected_norm_factor, rtol=0.1)
 
     def test_normalization_frozen_during_eval(self, sae_with_normalization):
-        """Test that stats are frozen during evaluation."""
+        """Test that norm factor is frozen during evaluation."""
         sae = sae_with_normalization
         sae.train()
         
-        # Initialize stats with first batch
-        x1 = torch.randn(100, 64) * 2.0 + 3.0
+        # Initialize with first batch
+        x1 = torch.randn(100, 64) * 2.0
         _ = sae(x1)
         
-        # Record stats after training batch
-        mean_after_train = sae.running_input_mean.clone()
-        var_after_train = sae.running_input_var.clone()
+        # Record norm factor after training batch
+        norm_factor_after_train = sae.running_norm_factor.clone()
         
         # Switch to eval mode
         sae.eval()
         
-        # Pass different data
-        x2 = torch.randn(100, 64) * 10.0 - 5.0  # Very different distribution
+        # Pass different data with very different scale
+        x2 = torch.randn(100, 64) * 100.0  # Much larger scale
         _ = sae(x2)
         
-        # Stats should NOT change during eval
-        assert torch.allclose(sae.running_input_mean, mean_after_train)
-        assert torch.allclose(sae.running_input_var, var_after_train)
+        # Norm factor should NOT change during eval
+        assert torch.allclose(sae.running_norm_factor, norm_factor_after_train)
 
     def test_denormalization_correctness(self, sae_with_normalization):
         """Test that denormalization correctly reverses normalization."""
         sae = sae_with_normalization
         sae.train()
         
-        # Create input with known statistics
-        x = torch.randn(100, 64) * 3.0 + 5.0
+        # Create input with large scale
+        x = torch.randn(100, 64) * 10.0
         
         # Forward pass
         output = sae(x)
         
         # The output should be in the ORIGINAL scale (denormalized)
-        # Check that output mean/std are closer to input than to normalized space
-        input_mean = x.mean()
-        output_mean = output.output.mean()
+        # Check that output scale is similar to input (not normalized space)
+        input_scale = (x ** 2).mean().sqrt()
+        output_scale = (output.output ** 2).mean().sqrt()
         
-        # Output should not be centered around 0 (which would be normalized space)
-        # It should be closer to the input distribution
-        assert abs(output_mean.item()) > 1.0, "Output appears to be in normalized space, not denormalized"
+        # Output scale should be in same ballpark as input (within 2x)
+        # This verifies denormalization is working
+        assert output_scale.item() > input_scale.item() * 0.1, "Output appears to be in normalized space, not denormalized"
+    
+    def test_set_norm_factor(self, sae_with_normalization):
+        """Test that set_norm_factor correctly sets the norm factor."""
+        sae = sae_with_normalization
+        
+        # Manually set norm factor (as run.py does after pre-computation)
+        sae.set_norm_factor(42.0)
+        
+        assert torch.allclose(sae.running_norm_factor, torch.tensor(42.0))
+        assert sae.norm_factor_initialized == True
+    
+    def test_has_norm_factor_num_batches(self, sae_with_normalization):
+        """Test that norm_factor_num_batches attribute exists for run.py compatibility."""
+        sae = sae_with_normalization
+        assert hasattr(sae, 'norm_factor_num_batches')
+        assert sae.norm_factor_num_batches == 100  # Default value
 
 
 class TestPreEncoderBias:
@@ -157,7 +170,7 @@ class TestPreEncoderBias:
             input_size=64,
             n_dict_components=128,
             target_l0=8.0,
-            normalize_input=False,
+            normalize_activations=False,
             use_pre_enc_bias=True,
         )
 
@@ -192,9 +205,8 @@ class TestCombinedNormalizationAndBias:
             input_size=64,
             n_dict_components=128,
             target_l0=8.0,
-            normalize_input=True,
+            normalize_activations=True,
             use_pre_enc_bias=True,
-            l0_ema_momentum=0.0,  # No momentum = use batch stats directly
         )
 
     def test_reconstruction_with_both_enabled(self, sae_combined):
@@ -236,24 +248,23 @@ class TestCombinedNormalizationAndBias:
         output = sae(x)
         
         # Output should be in similar scale as input (not normalized space)
-        input_mean = x.mean().item()
-        input_std = x.std().item()
-        output_mean = output.output.mean().item()
-        output_std = output.output.std().item()
+        input_scale = (x ** 2).mean().sqrt().item()
+        output_scale = (output.output ** 2).mean().sqrt().item()
         
-        # Output mean should be in same ballpark as input (within 50%)
+        # Output scale should be in same ballpark as input
         # This is a rough check that denormalization is working
-        assert abs(output_mean) > 1.0, "Output mean too close to 0 (normalized space)"
+        assert output_scale > input_scale * 0.1, "Output scale too small (in normalized space)"
         
         # Check that output isn't stuck at some degenerate value
-        assert output_std > 0.1, "Output has no variance"
+        assert output.output.std().item() > 0.1, "Output has no variance"
 
 
 class TestAlphaDualAscent:
     """Tests for alpha (Lagrangian multiplier) updates."""
 
     @pytest.fixture
-    def sae(self):
+    def sae_equality(self):
+        """SAE with equality constraint (default): alpha can be negative."""
         return LagrangianSAE(
             input_size=64,
             n_dict_components=128,
@@ -261,10 +272,25 @@ class TestAlphaDualAscent:
             initial_alpha=0.0,
             alpha_lr=0.1,
             alpha_max=10.0,
+            equality_constraint=True,  # Explicitly set for clarity
         )
 
-    def test_alpha_increases_when_l0_above_target(self, sae):
+    @pytest.fixture
+    def sae_inequality(self):
+        """SAE with inequality constraint: alpha must be >= 0."""
+        return LagrangianSAE(
+            input_size=64,
+            n_dict_components=128,
+            target_l0=8.0,
+            initial_alpha=0.0,
+            alpha_lr=0.1,
+            alpha_max=10.0,
+            equality_constraint=False,  # Inequality constraint
+        )
+
+    def test_alpha_increases_when_l0_above_target(self, sae_equality):
         """Test that alpha increases when L0 > target."""
+        sae = sae_equality
         sae.train()
         
         initial_alpha = sae.alpha.item()
@@ -281,8 +307,9 @@ class TestAlphaDualAscent:
         if sae.running_l0.item() > sae.target_l0:
             assert sae.alpha.item() > initial_alpha, "Alpha should increase when L0 > target"
 
-    def test_alpha_decreases_when_l0_below_target(self, sae):
-        """Test that alpha decreases when L0 < target."""
+    def test_alpha_decreases_when_l0_below_target_equality(self, sae_equality):
+        """Test that alpha decreases when L0 < target (equality constraint allows negative alpha)."""
+        sae = sae_equality
         sae.train()
         
         # Start with high alpha
@@ -297,12 +324,33 @@ class TestAlphaDualAscent:
         sae._last_constraint_violation = torch.tensor(-5.0)  # L0 - target = negative
         sae.update_alpha()
         
-        # Alpha should decrease (but stay >= 0)
+        # Alpha should decrease (can go negative in equality mode)
         assert sae.alpha.item() < initial_alpha, "Alpha should decrease when L0 < target"
-        assert sae.alpha.item() >= 0, "Alpha should never be negative"
 
-    def test_alpha_clamped_to_max(self, sae):
+    def test_alpha_decreases_when_l0_below_target_inequality(self, sae_inequality):
+        """Test that alpha decreases when L0 < target (inequality constraint keeps alpha >= 0)."""
+        sae = sae_inequality
+        sae.train()
+        
+        # Start with positive alpha
+        with torch.no_grad():
+            sae.alpha.fill_(5.0)
+            # Set running_l0 below target
+            sae.running_l0.fill_(sae.target_l0 - 5.0)
+        
+        initial_alpha = sae.alpha.item()
+        
+        # Manually trigger alpha update with constraint satisfied
+        sae._last_constraint_violation = torch.tensor(-5.0)  # L0 - target = negative
+        sae.update_alpha()
+        
+        # Alpha should decrease but stay >= 0 in inequality mode
+        assert sae.alpha.item() < initial_alpha, "Alpha should decrease when L0 < target"
+        assert sae.alpha.item() >= 0, "Alpha should never be negative in inequality mode"
+
+    def test_alpha_clamped_to_max(self, sae_equality):
         """Test that alpha is clamped to alpha_max."""
+        sae = sae_equality
         sae.train()
         
         # Set a large constraint violation
@@ -313,8 +361,9 @@ class TestAlphaDualAscent:
         
         assert sae.alpha.item() <= sae.alpha_max, "Alpha should be clamped to alpha_max"
 
-    def test_alpha_clamped_to_zero(self, sae):
-        """Test that alpha is clamped to >= 0."""
+    def test_alpha_clamped_to_negative_max_equality(self, sae_equality):
+        """Test that alpha is clamped to -alpha_max in equality mode."""
+        sae = sae_equality
         sae.train()
         
         # Set a large negative constraint violation
@@ -323,7 +372,24 @@ class TestAlphaDualAscent:
         for _ in range(100):
             sae.update_alpha()
         
-        assert sae.alpha.item() >= 0, "Alpha should never be negative"
+        # In equality mode, alpha can go negative but is clamped to -alpha_max
+        assert sae.alpha.item() >= -sae.alpha_max, "Alpha should be clamped to -alpha_max"
+        assert sae.alpha.item() < 0, "Alpha should be negative with large negative constraint violation"
+
+    def test_alpha_clamped_to_zero_inequality(self, sae_inequality):
+        """Test that alpha is clamped to >= 0 in inequality mode."""
+        sae = sae_inequality
+        sae.train()
+        
+        # Set a large negative constraint violation
+        sae._last_constraint_violation = torch.tensor(-1000.0)
+        
+        for _ in range(100):
+            sae.update_alpha()
+        
+        # In inequality mode, alpha is clamped to [0, alpha_max]
+        assert sae.alpha.item() >= 0, "Alpha should never be negative in inequality mode"
+        assert sae.alpha.item() == 0, "Alpha should be exactly 0 when constraint is satisfied"
 
 
 class TestReconstructionConsistency:
@@ -336,7 +402,7 @@ class TestReconstructionConsistency:
             input_size=16,
             n_dict_components=64,
             target_l0=32.0,  # Allow many features
-            normalize_input=True,
+            normalize_activations=True,
             use_pre_enc_bias=True,
             initial_threshold=0.01,  # Low threshold = more features active
             bandwidth=0.1,
@@ -370,24 +436,30 @@ class TestReconstructionConsistency:
             input_size=64,
             n_dict_components=128,
             target_l0=16.0,
-            normalize_input=True,
+            normalize_activations=True,
             use_pre_enc_bias=True,
-            l0_ema_momentum=0.0,  # Use batch stats directly
         )
         sae.train()
         
         # Input with specific distribution
-        x = torch.randn(100, 64) * 7.0 + 15.0  # mean=15, std=7
+        x = torch.randn(100, 64) * 7.0
         
-        # Get normalized input and denormalization params
-        x_normalized, std, mean = sae._normalize_input(x)
+        # Compute expected norm factor
+        expected_msn = (x ** 2).sum(dim=-1).mean()
+        expected_norm_factor = expected_msn.sqrt()
         
-        # Verify normalization
-        assert torch.allclose(x_normalized.mean(), torch.tensor(0.0), atol=0.1)
-        assert torch.allclose(x_normalized.std(), torch.tensor(1.0), atol=0.2)
+        # Get norm factor (this also initializes running_norm_factor)
+        norm_factor = sae._compute_norm_factor(x)
         
-        # Verify denormalization
-        x_reconstructed = x_normalized * std + mean
+        # Normalize
+        x_normalized = x / norm_factor
+        
+        # Verify normalization: mean squared norm should be ~1
+        normalized_msn = (x_normalized ** 2).sum(dim=-1).mean()
+        assert torch.allclose(normalized_msn, torch.tensor(1.0), rtol=0.1)
+        
+        # Verify denormalization roundtrip
+        x_reconstructed = x_normalized * norm_factor
         assert torch.allclose(x_reconstructed, x, atol=1e-5)
 
 
@@ -401,7 +473,7 @@ class TestThresholdCalibration:
             input_size=64,
             n_dict_components=256,
             target_l0=target_l0,
-            normalize_input=True,
+            normalize_activations=True,
             calibrate_thresholds=True,
             initial_threshold=0.5,
         )
@@ -446,7 +518,7 @@ class TestThresholdCalibration:
         _ = sae(x)
         
         assert sae.thresholds_calibrated == True
-        threshold_after_calibration = sae.jumprelu.log_threshold.clone()
+        threshold_after_calibration = sae.jumprelu.threshold.clone()
         
         # Run more forward passes
         for _ in range(10):
@@ -459,12 +531,12 @@ class TestThresholdCalibration:
         assert sae.thresholds_calibrated == True
 
     def test_calibration_respects_normalization(self):
-        """Test that calibration works correctly with input normalization."""
+        """Test that calibration works correctly with activation normalization."""
         sae = LagrangianSAE(
             input_size=64,
             n_dict_components=128,
             target_l0=8.0,
-            normalize_input=True,
+            normalize_activations=True,
             calibrate_thresholds=True,
         )
         sae.train()

@@ -1,5 +1,5 @@
 # Experiment Settings
-wandb_project: gemma2-2b-50M
+wandb_project: gemma2-2b
 wandb_run_name: matryoshka
 wandb_tags: ["matryoshka"]
 seed: 42

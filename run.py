@@ -27,6 +27,7 @@ from utils.logging import logger
 from utils.schedulers import (
     get_linear_lr_schedule,
     get_cosine_schedule_with_warmup,
+    get_dictionary_learning_lr_schedule,
 )
 from utils.metrics import all_metrics
 from settings import settings
@@ -88,6 +89,123 @@ def evaluate(
     return accumulated_metrics
 
 
+@torch.inference_mode()
+def compute_norm_factors_for_saes(
+    model: SAETransformer,
+    train_loader: DataLoader,
+    config: Config,
+    device: torch.device,
+) -> bool:
+    """Compute norm factors for SAEs that need them (e.g., JumpReLU with normalize_activations=True).
+    
+    This iterates through the first N batches to compute a stable norm factor estimate,
+    matching dictionary_learning's approach which computes over 100 batches.
+    
+    Args:
+        model: The SAETransformer model.
+        train_loader: The training data loader.
+        config: The config object.
+        device: The device to run on.
+        
+    Returns:
+        True if batches were consumed (dataloader needs to be re-created for streaming datasets),
+        False otherwise.
+    """
+    # Find SAEs that need norm factor computation
+    saes_needing_norm_factor: list[tuple[str, torch.nn.Module, int]] = []
+    
+    for name, module in model.saes.named_modules():
+        if hasattr(module, 'normalize_activations') and module.normalize_activations:
+            if hasattr(module, 'norm_factor_initialized') and not module.norm_factor_initialized:
+                num_batches = getattr(module, 'norm_factor_num_batches', 100)
+                saes_needing_norm_factor.append((name, module, num_batches))
+    
+    if not saes_needing_norm_factor:
+        return False
+    
+    # Get the maximum number of batches needed
+    max_batches = max(num_batches for _, _, num_batches in saes_needing_norm_factor)
+    
+    # Find which positions we need to cache activations for
+    positions_to_cache = model.raw_sae_positions
+    
+    # Accumulate mean squared norms per position
+    # Structure: {position: {"total_msn": float, "count": int}}
+    accumulators: dict[str, dict[str, float]] = {
+        pos: {"total_msn": 0.0, "count": 0} for pos in positions_to_cache
+    }
+    
+    # Determine stop_at_layer for efficiency
+    stop_at_layer = None
+    if all(name.startswith("blocks.") for name in model.raw_sae_positions):
+        stop_at_layer = max([int(name.split(".")[1]) for name in model.raw_sae_positions]) + 1
+    
+    logger.info(f"Computing norm factors over {max_batches} batches for SAEs: {[name for name, _, _ in saes_needing_norm_factor]}")
+    
+    model.saes.eval()
+    
+    for batch_idx, batch in enumerate(tqdm(train_loader, total=max_batches, desc="Computing norm factors")):
+        if batch_idx >= max_batches:
+            break
+        
+        tokens = batch[config.data.column_name].to(device=device)
+        
+        # Run forward pass to get activations (without SAE processing)
+        # We use run_with_hooks directly to get raw activations
+        activation_cache: dict[str, torch.Tensor] = {}
+        
+        def cache_hook(position: str):
+            def hook_fn(x: torch.Tensor, hook):
+                activation_cache[position] = x.detach().clone()
+                return x
+            return hook_fn
+        
+        model.tlens_model.run_with_hooks(
+            tokens,
+            fwd_hooks=[(pos, cache_hook(pos)) for pos in positions_to_cache],
+            stop_at_layer=stop_at_layer,
+        )
+        
+        # Accumulate mean squared norms for each position
+        for pos, act in activation_cache.items():
+            act_flat = act.reshape(-1, act.shape[-1])
+            mean_squared_norm = (act_flat ** 2).sum(dim=-1).mean().item()
+            accumulators[pos]["total_msn"] += mean_squared_norm
+            accumulators[pos]["count"] += 1
+    
+    # Compute final norm factors and set them on SAE modules
+    for name, module, num_batches in saes_needing_norm_factor:
+        # Find the corresponding position for this SAE
+        # The name in named_modules() uses "-" instead of "." for ModuleDict keys
+        sae_position = name.replace("-", ".")
+        
+        # Find matching position
+        matching_pos = None
+        for pos in positions_to_cache:
+            pos_key = pos.replace(".", "-")
+            if pos_key == name or name.endswith(pos_key):
+                matching_pos = pos
+                break
+        
+        if matching_pos is None:
+            logger.warning(f"Could not find matching position for SAE {name}")
+            continue
+        
+        acc = accumulators[matching_pos]
+        if acc["count"] == 0:
+            logger.warning(f"No batches accumulated for SAE {name}")
+            continue
+        
+        average_msn = acc["total_msn"] / acc["count"]
+        norm_factor = average_msn ** 0.5
+        
+        module.set_norm_factor(norm_factor)
+        logger.info(f"Set norm_factor={norm_factor:.4f} for SAE {name} (computed over {acc['count']} batches)")
+    
+    model.saes.train()
+    return True  # Batches were consumed
+
+
 @logging_redirect_tqdm()
 def train(
     config: Config,
@@ -98,18 +216,20 @@ def train(
     device: torch.device,
     cache_positions: list[str] | None = None,
 ) -> None:
-    model.saes.train()
 
     # TODO: Handling end-to-end training
     is_local = True
+    model.saes.train()
 
     for name, param in model.named_parameters():
         if name.startswith("saes.") and name.split("saes.")[1] in trainable_param_names:
             param.requires_grad = True
         else:
             param.requires_grad = False
+    
     optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=config.lr
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=config.lr,
     )
     warmup_steps = config.warmup_samples // config.effective_batch_size
     if config.lr_schedule == "cosine":
@@ -120,6 +240,17 @@ def train(
             num_training_steps=config.data.n_train_samples // config.effective_batch_size,
             min_lr_factor=config.min_lr_factor,
         )
+    elif config.lr_schedule == "dictionary_learning":
+        assert config.data.n_train_samples is not None, "dictionary_learning schedule requires n_samples."
+        total_steps = config.data.n_train_samples // config.effective_batch_size
+        decay_start = int(total_steps * config.decay_start_fraction)
+        lr_schedule = get_dictionary_learning_lr_schedule(
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            decay_start=decay_start,
+        )
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+        logger.info(f"Using dictionary_learning LR schedule: warmup={warmup_steps}, decay_start={decay_start}, total={total_steps}")
     else:
         assert config.lr_schedule == "linear"
         lr_schedule = get_linear_lr_schedule(
@@ -193,14 +324,27 @@ def train(
         loss.backward()
 
         if is_grad_step:
+            # Pre-optimizer hooks
+            for module in model.saes.modules():
+                if hasattr(module, 'on_before_optimizer_step'):
+                    module.on_before_optimizer_step()
+
+            # Clip gradients
             if config.max_grad_norm is not None:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
+                grad_norm: float = torch.nn.utils.clip_grad_norm_(
                     model.saes.parameters(), config.max_grad_norm
                 ).item()
+
+            # Optimizer step
             optimizer.step()
             optimizer.zero_grad()
             grad_updates += 1
             lr_scheduler.step()
+
+            # Post-optimizer hooks
+            for module in model.saes.modules():
+                if hasattr(module, 'on_after_optimizer_step'):
+                    module.on_after_optimizer_step()
 
             # Update training progress for all SAE modules
             for module in model.saes.modules():
@@ -327,6 +471,8 @@ def run(config_path_or_obj: Path | str | Config, device: torch.device | None = N
         tlens_model_path=config.tlens_model_path, 
         device=device,
         dtype=config.dtype,
+        use_torch_compile=config.use_torch_compile,
+        torch_compile_mode=config.torch_compile_mode,
     )
 
     cache_positions: list[str] | None = None
@@ -350,6 +496,25 @@ def run(config_path_or_obj: Path | str | Config, device: torch.device | None = N
 
     assert len(trainable_param_names) > 0, "No trainable parameters found."
     logger.info(f"Trainable parameters: {trainable_param_names}")
+
+    # Compute norm factors for SAEs that need them (e.g., JumpReLU with normalize_activations=True)
+    # This matches dictionary_learning's approach of computing over multiple batches before training
+    batches_consumed = compute_norm_factors_for_saes(
+        model=model,
+        train_loader=train_loader,
+        config=config,
+        device=device,
+    )
+    
+    # For streaming datasets, we need to re-create the dataloader since batches were consumed
+    if batches_consumed and config.data.streaming:
+        logger.info("Re-creating train dataloader after norm factor computation (streaming dataset)")
+        train_loader, _ = create_dataloaders(
+            data_config=config.data,
+            global_seed=config.seed,
+            quick_eval=quick_eval,
+            mini_batch_size=config.mini_batch_size,
+        )
 
     train(
         config=config,

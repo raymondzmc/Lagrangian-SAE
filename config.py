@@ -40,6 +40,16 @@ class Config(BaseModel):
         "float32",
         description="Data type for model and SAE training. Use 'bfloat16' for larger models like Gemma-2."
     )
+    use_torch_compile: bool = Field(
+        False,
+        description="Enable torch.compile for the transformer model. Uses PyTorch's inductor "
+        "backend which can optimize attention to use flash attention when available."
+    )
+    torch_compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = Field(
+        "reduce-overhead",
+        description="torch.compile mode. 'reduce-overhead' is good for inference-heavy workloads, "
+        "'max-autotune' provides best performance but longer initial compilation."
+    )
     save_dir: Path | None = settings.output_dir
 
     save_every_n_samples: PositiveInt | None = None
@@ -48,7 +58,7 @@ class Config(BaseModel):
     )
     gradient_accumulation_steps: PositiveInt = 1
     lr: PositiveFloat
-    lr_schedule: Literal["linear", "cosine"] = "cosine"
+    lr_schedule: Literal["linear", "cosine", "dictionary_learning"] = "cosine"
     min_lr_factor: NonNegativeFloat = Field(
         0.1,
         description="The minimum learning rate as a factor of the initial learning rate. Used "
@@ -56,6 +66,11 @@ class Config(BaseModel):
     )
     warmup_samples: NonNegativeInt = 0
     cooldown_samples: NonNegativeInt = 0
+    decay_start_fraction: float = Field(
+        0.8,
+        description="Fraction of training at which LR decay starts (for dictionary_learning schedule). "
+        "E.g., 0.8 means decay starts at 80% of training.",
+    )
     max_grad_norm: PositiveFloat | None = None
     log_every_n_grad_steps: PositiveInt = 20
     # collect_act_frequency_every_n_samples: NonNegativeInt = Field(

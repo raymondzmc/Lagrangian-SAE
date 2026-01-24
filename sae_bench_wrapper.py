@@ -226,7 +226,8 @@ class SAEBenchWrapper(nn.Module):
         # Use the original SAE's forward pass for faithful reconstruction
         with torch.no_grad():
             sae_output = self._sae(x_orig_device)
-            reconstructed = sae_output.output
+            # Use raw output for JumpReLU with normalization, fallback to output for other SAEs
+            reconstructed = getattr(sae_output, 'output_raw', sae_output.output)
         
         # Move back to wrapper's device if needed
         return reconstructed.to(self.device)

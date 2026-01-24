@@ -198,18 +198,23 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 for sae_pos in raw_sae_positions:
                     sae_output = output.sae_outputs[sae_pos]
                     
+                    # Use raw output for JumpReLU with normalization, fallback to output for other SAEs
+                    raw_output = getattr(sae_output, 'output_raw', sae_output.output)
+                    # Get original input from activation cache for normalized SAEs
+                    original_input = output.activations.get(sae_pos, sae_output.input)
+                    
                     # Compute MSE using the same logic as utils/metrics.py
                     mse_val = mse_loss(
-                        sae_output.output,
-                        sae_output.input,
+                        raw_output,
+                        original_input,
                         reduction='mean'
                     ).item()
                     metrics[sae_pos]['mse'] += mse_val * n_tokens
                     
                     # Compute explained variance using the shared function from utils.metrics
                     exp_var = explained_variance(
-                        sae_output.output,
-                        sae_output.input,
+                        raw_output,
+                        original_input,
                         layer_norm_flag=False
                     ).mean().item()
                     metrics[sae_pos]['explained_variance'] += exp_var * n_tokens

@@ -48,16 +48,19 @@ saes:
     - blocks.8.hook_resid_pre
     - blocks.10.hook_resid_pre
   init_decoder_orthogonal: true
+  
   # JumpReLU specific parameters
-  target_l0: 32.0  # Target L0 sparsity (number of active features per sample)
+  target_l0: 32.0
   bandwidth: 0.001
   initial_threshold: 0.001
   use_pre_enc_bias: true
   tied_encoder_init: true
-  # L0 regularization coefficient
+  normalize_activations: true
+  norm_factor_num_batches: 100  # Compute norm factor over 100 batches before training
   sparsity_coeff: 1.0
   mse_coeff: 1.0
-  # Dead feature tracking and auxiliary loss
+  sparsity_warmup_steps: 5000
   dead_toks_threshold: 10_000_000
-  aux_k: 512  # Number of auxiliary features from dead latents
-  aux_coeff: 0.03125  # Coefficient for auxiliary reconstruction loss
+  aux_k: 512
+  aux_coeff: 0.03125
+

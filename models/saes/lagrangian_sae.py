@@ -57,8 +57,10 @@ class LagrangianSAEConfig(SAEConfig):
     tied_encoder_init: bool = Field(True, description="Initialize encoder as decoder.T")
     use_pre_enc_bias: bool = Field(False, description="Subtract decoder bias before encoding")
     
-    # Input normalization (recommended for consistent behavior across layers)
-    normalize_input: bool = Field(False, description="Normalize input to unit variance before encoding (helps with layer-wise scale differences)")
+    # Activation normalization (recommended for consistent behavior across layers)
+    # Uses same naming convention as JumpReLUSAE for compatibility with run.py pre-computation
+    normalize_activations: bool = Field(False, description="Normalize inputs to unit mean squared norm (recommended for stable training)")
+    norm_factor_num_batches: int = Field(100, description="Number of batches to compute norm factor over before training (dictionary_learning uses 100)")
     
     # Running mean (EMA) parameters for stable L0 estimation
     l0_ema_momentum: float = Field(0.99, description="Momentum for running mean of L0 (higher = smoother)")
@@ -148,7 +150,8 @@ class LagrangianSAE(BaseSAE):
         init_decoder_orthogonal: bool = True,
         tied_encoder_init: bool = True,
         use_pre_enc_bias: bool = False,
-        normalize_input: bool = False,
+        normalize_activations: bool = False,
+        norm_factor_num_batches: int = 100,
         calibrate_thresholds: bool = True,
         equality_constraint: bool = True,
     ):
@@ -173,7 +176,8 @@ class LagrangianSAE(BaseSAE):
             init_decoder_orthogonal: Initialize decoder weight columns to be orthonormal.
             tied_encoder_init: Initialize encoder.weight = decoder.weight.T.
             use_pre_enc_bias: Whether to subtract decoder bias before encoding.
-            normalize_input: Normalize input to unit variance before encoding.
+            normalize_activations: Normalize inputs to unit mean squared norm (recommended for stable training).
+            norm_factor_num_batches: Number of batches to compute norm factor over before training.
             calibrate_thresholds: Auto-calibrate thresholds on first batch to achieve target L0.
             equality_constraint: If True, enforce L0 ≈ target (equality); if False, enforce L0 <= target (inequality).
         """
@@ -196,7 +200,8 @@ class LagrangianSAE(BaseSAE):
         self.l0_ema_momentum = l0_ema_momentum
         self.bandwidth = bandwidth
         self.use_pre_enc_bias = use_pre_enc_bias
-        self.normalize_input = normalize_input
+        self.normalize_activations = normalize_activations
+        self.norm_factor_num_batches = norm_factor_num_batches
         self.equality_constraint = equality_constraint
 
         # Loss coefficients
@@ -247,11 +252,12 @@ class LagrangianSAE(BaseSAE):
         # Dead latent tracking - counts tokens since last activation
         self.register_buffer("stats_last_nonzero", torch.zeros(n_dict_components, dtype=torch.long))
         
-        # Running statistics for input normalization (if enabled)
-        # Uses scale-only normalization: x_norm = x / scale to achieve mean squared L2 norm ≈ 1
-        if self.normalize_input:
-            self.register_buffer("running_msn", torch.tensor(1.0))  # mean squared norm
-            self.register_buffer("input_stats_initialized", torch.tensor(False))
+        # Running statistics for activation normalization (if enabled)
+        # Uses scale-only normalization: x_norm = x / norm_factor where norm_factor = sqrt(E[||x||²])
+        # Uses same naming convention as JumpReLUSAE for compatibility with run.py pre-computation
+        if self.normalize_activations:
+            self.register_buffer("running_norm_factor", torch.tensor(1.0))
+            self.register_buffer("norm_factor_initialized", torch.tensor(False))
         
         # Threshold calibration state
         self.calibrate_thresholds = calibrate_thresholds
@@ -291,8 +297,8 @@ class LagrangianSAE(BaseSAE):
         # Clamp thresholds to be positive (JumpReLU requires positive thresholds)
         threshold_values = threshold_values.clamp(min=1e-4)
         
-        # Set log_threshold
-        self.jumprelu.log_threshold.data.copy_(torch.log(threshold_values))
+        # Set threshold directly (raw parameterization)
+        self.jumprelu.threshold.data.copy_(threshold_values)
         
         # Mark as calibrated
         self.thresholds_calibrated.fill_(True)
@@ -305,59 +311,88 @@ class LagrangianSAE(BaseSAE):
               f"min={min_threshold:.4f}, max={max_threshold:.4f}, "
               f"target_percentile={target_percentile:.6f}")
 
-    def _normalize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute_norm_factor(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute or update the norm factor for activation normalization.
+        
+        The norm factor is sqrt(E[||x||²]) so that x/norm_factor has unit mean squared norm.
+        
+        IMPORTANT: Even when an external accumulator is refining the norm_factor over multiple
+        batches, we MUST use a reasonable estimate from the first batch. Otherwise, the
+        threshold will learn wrong values during the accumulation period (since threshold 0.001
+        is calibrated for normalized activations, not raw activations with magnitude ~50).
+        
+        This method matches JumpReLUSAE's _compute_norm_factor for compatibility with run.py.
+        
+        Args:
+            x: Input tensor with shape (..., input_size)
+            
+        Returns:
+            The norm factor to use for this forward pass
         """
-        Scale-only normalization to achieve mean squared L2 norm ≈ 1.
+        # Check if we've computed an initial estimate (even if not "fully initialized")
+        has_initial_estimate = getattr(self, '_has_initial_norm_estimate', False)
         
-        Computes: x_normalized = x / scale, where scale = sqrt(E[||x||²/d])
-        This preserves the mean/direction of activations while ensuring E[||x||²/d] ≈ 1.
-        
-        Returns the normalized input and scale factor for denormalization.
-        """
-        # Compute mean squared norm: E[||x||²/d] = mean of all squared elements
-        batch_msn = (x ** 2).mean()
-        
-        if self.training:
+        if self.training and not self.norm_factor_initialized and not has_initial_estimate:
             with torch.no_grad():
-                if not self.input_stats_initialized:
-                    self.running_msn.copy_(batch_msn)
-                    self.input_stats_initialized.fill_(True)
-                else:
-                    # EMA update
-                    momentum = self.l0_ema_momentum
-                    self.running_msn.mul_(momentum).add_((1 - momentum) * batch_msn)
+                # Compute mean squared norm: E[||x||²]
+                # Flatten batch dimensions for computation
+                x_flat = x.reshape(-1, x.shape[-1])
+                mean_squared_norm = (x_flat ** 2).sum(dim=-1).mean()
+                norm_factor = mean_squared_norm.sqrt()
+                
+                self.running_norm_factor.copy_(norm_factor)
+                self._has_initial_norm_estimate = True
+                
+                # Only mark as fully initialized if NOT using external accumulator
+                # External accumulator will refine and mark initialized when ready
+                defer_init = getattr(self, '_defer_norm_factor_init', False)
+                if not defer_init:
+                    self.norm_factor_initialized.fill_(True)
         
-        # Scale factor: sqrt(running_msn)
-        scale = (self.running_msn + 1e-8).sqrt()
-        x_normalized = x / scale
+        return self.running_norm_factor
+    
+    def set_norm_factor(self, norm_factor: float) -> None:
+        """Manually set the norm factor for activation normalization.
         
-        return x_normalized, scale
+        This can be used to pre-compute norm_factor over multiple batches
+        (matching dictionary_learning behavior which computes it once over 100 batches).
+        
+        This method is called by run.py's compute_norm_factors_for_saes() function.
+        
+        Args:
+            norm_factor: The norm factor to use (sqrt of mean squared activation norm)
+        """
+        with torch.no_grad():
+            self.running_norm_factor.fill_(norm_factor)
+            self.norm_factor_initialized.fill_(True)
 
     def forward(self, x: Float[torch.Tensor, "... dim"]) -> LagrangianSAEOutput:
         """
         Forward pass (supports arbitrary leading batch dims; last dim == input_size).
         
-        If normalize_input is enabled:
+        If normalize_activations is enabled:
         - Input is scaled to achieve mean squared L2 norm ≈ 1 (preserves mean/direction)
         - SAE operates in normalized space (encoding, thresholding, decoding)
         - Output is denormalized back to original scale
         - MSE loss is computed in original space for proper comparison
         """
-        # Optional: scale-only normalization to achieve mean squared L2 norm ≈ 1
-        if self.normalize_input:
-            x_normalized, input_scale = self._normalize_input(x)
+        # Activation normalization (if enabled)
+        if self.normalize_activations:
+            norm_factor = self._compute_norm_factor(x)
+            x_normalized = x / norm_factor
         else:
+            norm_factor = None
             x_normalized = x
-            input_scale = None
         
-        # Optional: subtract decoder bias before encoding
+        # Optional: subtract decoder bias before encoding (matches apply_b_dec_to_input in dictionary_learning)
         if self.use_pre_enc_bias:
             x_enc = x_normalized - self.decoder_bias
         else:
             x_enc = x_normalized
 
-        # Encoder with ReLU pre-activation
-        preacts = F.relu(self.encoder(x_enc) + self.encoder_bias)
+        # Encoder pre-activations (no ReLU - matches dictionary_learning's jumprelu.py)
+        # JumpReLU will handle the activation directly on these pre-activations
+        preacts = self.encoder(x_enc) + self.encoder_bias
         
         # Threshold calibration on first batch (if enabled and not yet calibrated)
         if self.calibrate_thresholds and self.training and not self.thresholds_calibrated:
@@ -388,8 +423,8 @@ class LagrangianSAE(BaseSAE):
         x_hat_normalized = F.linear(c, self.dict_elements, bias=self.decoder_bias)
         
         # Denormalize output back to original scale (scale-only: just multiply)
-        if self.normalize_input and input_scale is not None:
-            x_hat = x_hat_normalized * input_scale
+        if self.normalize_activations and norm_factor is not None:
+            x_hat = x_hat_normalized * norm_factor
         else:
             x_hat = x_hat_normalized
 
@@ -399,7 +434,7 @@ class LagrangianSAE(BaseSAE):
         # Compute differentiable L0 using StepFunction (gradient flows to learned thresholds)
         l0_differentiable = StepFunction.apply(
             preacts, 
-            self.jumprelu.log_threshold, 
+            self.jumprelu.threshold, 
             self.bandwidth
         ).sum(dim=-1)
 

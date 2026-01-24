@@ -68,7 +68,7 @@ saes:
   equality_constraint: true
   tied_encoder_init: true
   use_pre_enc_bias: true
-  normalize_input: true
+  normalize_activations: true
   # Dead feature tracking and auxiliary loss
   dead_toks_threshold: 10_000_000
   aux_k: 512  # Number of auxiliary features from dead latents (same as TopK/BatchTopK)

@@ -1,0 +1,4 @@
+wandb_project: "gemma2-2b-16K-50M"
+target_l0: [20, 40, 80, 160, 320]
+alpha_max: [10]
+n_dict_components: 16384

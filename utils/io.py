@@ -43,13 +43,15 @@ def save_module(
     logger.info("Saved model to %s", save_dir / model_filename)
 
 
-def load_config(config_path_or_obj: Path | str | BaseModelType | dict[str, Any], config_model: type[BaseModelType]) -> BaseModelType:
+def load_config(config_path_or_obj: Path | str | BaseModelType | dict[str, Any], config_model: type[BaseModelType], ignore_extra: bool = True) -> BaseModelType:
     """Load the config of class `config_model`, either from YAML file or existing config object.
 
     Args:
         config_path_or_obj (Union[Path, str, `config_model`]): if config object, must be instance
             of `config_model`. If str or Path, this must be the path to a .yaml.
         config_model: the class of the config that we are loading
+        ignore_extra: if True, silently ignore fields not in the model (useful for wandb configs
+                      that may contain computed fields or fields from older versions)
     """
     if isinstance(config_path_or_obj, config_model):
         return config_path_or_obj
@@ -69,7 +71,50 @@ def load_config(config_path_or_obj: Path | str | BaseModelType | dict[str, Any],
         assert Path(config_path_or_obj).exists(), f"Config file {config_path_or_obj} does not exist."
         with open(config_path_or_obj) as f:
             config_dict = yaml.safe_load(f)
+    
+    if ignore_extra:
+        # Filter out extra fields that don't exist in the model
+        # This handles computed fields that were serialized, or fields from older config versions
+        config_dict = _filter_extra_fields(config_dict, config_model)
+    
     return config_model(**config_dict)
+
+
+def _filter_extra_fields(config_dict: dict[str, Any], config_model: type[BaseModelType]) -> dict[str, Any]:
+    """Recursively filter out fields that don't exist in the pydantic model.
+    
+    This is useful when loading configs from wandb that may contain:
+    - Computed fields that were serialized
+    - Fields from older versions of the config
+    """
+    from pydantic import BaseModel
+    from pydantic.fields import FieldInfo
+    
+    # Get the model's field names
+    model_fields = set(config_model.model_fields.keys())
+    
+    filtered = {}
+    for key, value in config_dict.items():
+        if key not in model_fields:
+            # Skip fields not in the model
+            continue
+        
+        field_info = config_model.model_fields.get(key)
+        if field_info is not None:
+            # Get the field's annotation (type)
+            field_type = field_info.annotation
+            
+            # Handle nested pydantic models
+            if isinstance(value, dict):
+                # Check if the field type is a pydantic model
+                origin = getattr(field_type, '__origin__', None)
+                if origin is None and isinstance(field_type, type) and issubclass(field_type, BaseModel):
+                    # Recursively filter nested model
+                    value = _filter_extra_fields(value, field_type)
+            
+            filtered[key] = value
+    
+    return filtered
 
 
 # File Upload Functions

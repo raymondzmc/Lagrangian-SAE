@@ -34,7 +34,6 @@ data:
   column_name: "input_ids"
   split: "train"
 
-# SAE Configuration - Hard Concrete SAE with learned gates
 saes:
   name: "topk_sae"
   sae_type: "topk"

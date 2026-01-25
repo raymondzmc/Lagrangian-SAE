@@ -198,12 +198,41 @@ class SAEBenchWrapper(nn.Module):
         """
         Decode features back to activation space.
         
+        For JumpReLU with normalize_activations=True, we use the original SAE's
+        decoder to ensure correct denormalization.
+        
         Args:
             feature_acts: Feature tensor of shape (batch, d_sae) or (batch, seq, d_sae)
             
         Returns:
             Reconstructed activations of shape (batch, d_in) or (batch, seq, d_in)
         """
+        # For JumpReLU with normalization, delegate to original SAE's decoder
+        # to ensure correct denormalization
+        if self._sae_type == SAEType.JUMP_RELU:
+            if hasattr(self._sae, 'normalize_activations') and self._sae.normalize_activations:
+                orig_device = next(self._sae.parameters()).device
+                feature_acts_orig = feature_acts.to(orig_device)
+                
+                with torch.no_grad():
+                    # Decode using original SAE's decoder (in normalized space)
+                    import torch.nn.functional as F
+                    output_normalized = F.linear(
+                        feature_acts_orig, 
+                        self._sae.dict_elements, 
+                        bias=self._sae.decoder_bias
+                    )
+                    
+                    # Denormalize to match output_raw
+                    norm_factor = getattr(self._sae, 'running_norm_factor', None)
+                    if norm_factor is not None:
+                        output = output_normalized * norm_factor
+                    else:
+                        output = output_normalized
+                
+                return output.to(self.device)
+        
+        # For other SAE types, use wrapper's parameters
         return feature_acts @ self.W_dec + self.b_dec
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:

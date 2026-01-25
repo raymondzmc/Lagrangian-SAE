@@ -9,6 +9,59 @@ Key features:
 - Dual ascent on alpha to achieve target L0 sparsity (Lagrangian)
 - Differentiable L0 approximation for gradient computation
 - Running mean (EMA) of L0 for stable constraint evaluation
+
+============================================================================
+IMPORTANT CAVEATS FOR COMPARISONS
+============================================================================
+
+When comparing MatryoshkaLagrangianSAE with other SAE implementations, be aware
+of the following architectural differences that prevent direct apple-to-apple
+comparisons:
+
+1. ENCODER PRE-ACTIVATION (vs LagrangianSAE)
+   - MatryoshkaLagrangianSAE: Applies ReLU BEFORE JumpReLU
+     preacts = F.relu(self.encoder(x_enc) + self.encoder_bias)
+   - LagrangianSAE: No ReLU, passes raw encoder outputs to JumpReLU
+     preacts = self.encoder(x_enc) + self.encoder_bias
+   
+   Impact: JumpReLU thresholds have different semantics. With ReLU, all preacts
+   are non-negative, changing how threshold values affect sparsity. The same
+   threshold value will yield different L0 levels between implementations.
+
+2. NORMALIZATION APPROACH (vs MatryoshkaSAE)
+   - MatryoshkaLagrangianSAE: Uses `normalize_activations` (scale-only)
+     x_normalized = x / norm_factor where norm_factor = sqrt(E[||x||²])
+   - MatryoshkaSAE: Uses `input_unit_norm` (mean + std normalization)
+     x_normalized = (x - mean) / std
+   
+   Impact: These are semantically different normalizations. MatryoshkaLagrangianSAE
+   follows LagrangianSAE's approach, not MatryoshkaSAE's.
+
+3. SPARSITY MECHANISM (vs MatryoshkaSAE)
+   - MatryoshkaLagrangianSAE: Soft sparsity via JumpReLU + Lagrangian control
+     L0 varies per sample, targets average L0 ≈ target_l0
+   - MatryoshkaSAE: Hard sparsity via BatchTopK
+     Guarantees exactly k * batch_size total active features
+   
+   Impact: Direct L0/MSE metric comparisons are not meaningful. 
+   MatryoshkaLagrangianSAE may have samples with L0 >> target or L0 << target.
+
+4. ENCODER BIAS (vs MatryoshkaSAE)
+   - MatryoshkaLagrangianSAE: Has encoder_bias parameter (learned)
+   - MatryoshkaSAE: No separate encoder bias (only decoder_bias for centering)
+   
+   Impact: Different parameter counts and optimization dynamics.
+
+5. LOSS COMPOSITION
+   - MatryoshkaLagrangianSAE: MSE + Lagrangian penalty + quadratic penalty
+     Loss = Σ(group_weight[i] * MSE_i) + α * (L0 - target) + ρ/2 * (L0 - target)²
+   - MatryoshkaSAE: Progressive MSE only
+     Loss = Σ(group_weight[i] * MSE_i)
+   
+   Impact: Different optimization landscapes. The Lagrangian terms affect
+   how the model balances reconstruction vs sparsity.
+
+============================================================================
 """
 import torch
 import torch.nn.functional as F

@@ -63,12 +63,12 @@ saes:
   alpha_max: 1.0
   rho_quadratic: 0.001
   l0_ema_momentum: 0.99
-  equality_constraint: true
+  equality_constraint: false
   
   # JumpReLU threshold parameters
   initial_threshold: 0.5
-  bandwidth: 0.001
   calibrate_thresholds: true
+  bandwidth: 0.001
   
   # Auxiliary loss for dead features
   aux_k: 512

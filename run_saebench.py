@@ -62,6 +62,12 @@ try:
 except ImportError:
     HAS_RAVEL = False
 
+try:
+    import sae_bench.evals.sparse_probing_sae_probes.main as sparse_probing_sae_probes
+    HAS_SPARSE_PROBING_SAE_PROBES = True
+except ImportError:
+    HAS_SPARSE_PROBING_SAE_PROBES = False
+
 
 # Default configurations for different models
 MODEL_CONFIGS = {
@@ -110,6 +116,7 @@ OUTPUT_FOLDERS = {
     "scr": "eval_results/scr",
     "tpp": "eval_results/tpp",
     "sparse_probing": "eval_results/sparse_probing",
+    "sparse_probing_sae_probes": "eval_results/sparse_probing_sae_probes",
     "ravel": "eval_results/ravel",
 }
 
@@ -132,6 +139,40 @@ def get_model_config(model_name: str) -> dict:
         "dtype": "float32",
         "d_model": 768,
     }
+
+
+def find_run_by_name(project: str, run_name: str, entity: str | None = None) -> str:
+    """Find wandb run ID by run name.
+    
+    Args:
+        project: Wandb project name
+        run_name: Display name of the run
+        entity: Wandb entity (uses default from settings if None)
+    
+    Returns:
+        Full run path: entity/project/run_id
+    """
+    api = wandb.Api()
+    if entity is None:
+        entity = settings.wandb_entity
+    
+    if entity is None:
+        raise ValueError("Wandb entity not specified. Set WANDB_ENTITY in .env or pass --entity")
+    
+    # Query runs by name
+    print(f"Searching for run '{run_name}' in project '{entity}/{project}'...")
+    runs = api.runs(f"{entity}/{project}", filters={"display_name": run_name})
+    runs_list = list(runs)
+    
+    if len(runs_list) == 0:
+        raise ValueError(f"No run found with name '{run_name}' in project '{entity}/{project}'")
+    if len(runs_list) > 1:
+        print(f"Warning: Found {len(runs_list)} runs with name '{run_name}', using most recent")
+    
+    run = runs_list[0]
+    full_path = f"{entity}/{project}/{run.id}"
+    print(f"Found run: {full_path}")
+    return full_path
 
 
 def load_sae_from_wandb(wandb_run: str, device: torch.device) -> tuple[SAETransformer, Config, str]:
@@ -168,8 +209,8 @@ def load_sae_from_wandb(wandb_run: str, device: torch.device) -> tuple[SAETransf
     run = api.run(project_run)
     run_config = run.config
     
-    # Parse config
-    config = load_config(run_config, Config)
+    # Parse config (ignore extra fields from older configs)
+    config = load_config(run_config, Config, ignore_extra=True)
     
     return sae_transformer, config, run_id
 
@@ -254,11 +295,16 @@ def run_evaluations(
         output_folder = os.path.join(output_path, "sparse_probing")
         os.makedirs(output_folder, exist_ok=True)
         
+        # Enable lower_vram_usage for large models (>1B params)
+        is_large_model = any(x in model_name.lower() for x in ["gemma", "llama", "mistral", "2b", "7b", "13b"])
+        
         config = sparse_probing.SparseProbingEvalConfig(
             model_name=model_name,
             random_seed=random_seed,
             llm_batch_size=llm_batch_size,
             llm_dtype=llm_dtype,
+            lower_vram_usage=is_large_model,
+            sae_batch_size=8,  # Small batch to avoid OOM with large SAEs
         )
         
         return sparse_probing.run_eval(
@@ -278,12 +324,21 @@ def run_evaluations(
         output_folder = output_path
         os.makedirs(os.path.join(output_folder, "scr"), exist_ok=True)
         
+        # Enable lower_vram_usage for large models (>1B params)
+        is_large_model = any(x in model_name.lower() for x in ["gemma", "llama", "mistral", "2b", "7b", "13b"])
+        
+        # Use smaller batch sizes for large SAEs (65K+) to avoid OOM
+        scr_llm_batch_size = max(8, llm_batch_size // 2) if is_large_model else llm_batch_size
+        scr_sae_batch_size = 2 if is_large_model else 8  # Reduced from 8 to 2 for 65K SAEs
+        
         config = scr_and_tpp.ScrAndTppEvalConfig(
             model_name=model_name,
             random_seed=random_seed,
             perform_scr=True,
-            llm_batch_size=llm_batch_size,
+            llm_batch_size=scr_llm_batch_size,
             llm_dtype=llm_dtype,
+            lower_vram_usage=is_large_model,
+            sae_batch_size=scr_sae_batch_size,
         )
         
         return scr_and_tpp.run_eval(
@@ -303,12 +358,21 @@ def run_evaluations(
         output_folder = output_path
         os.makedirs(os.path.join(output_folder, "tpp"), exist_ok=True)
         
+        # Enable lower_vram_usage for large models (>1B params)
+        is_large_model = any(x in model_name.lower() for x in ["gemma", "llama", "mistral", "2b", "7b", "13b"])
+        
+        # Use smaller batch sizes for large SAEs (65K+) to avoid OOM
+        tpp_llm_batch_size = max(8, llm_batch_size // 2) if is_large_model else llm_batch_size
+        tpp_sae_batch_size = 2 if is_large_model else 8  # Reduced from 8 to 2 for 65K SAEs
+        
         config = scr_and_tpp.ScrAndTppEvalConfig(
             model_name=model_name,
             random_seed=random_seed,
             perform_scr=False,
-            llm_batch_size=llm_batch_size,
+            llm_batch_size=tpp_llm_batch_size,
             llm_dtype=llm_dtype,
+            lower_vram_usage=is_large_model,
+            sae_batch_size=tpp_sae_batch_size,
         )
         
         return scr_and_tpp.run_eval(
@@ -362,11 +426,17 @@ def run_evaluations(
         output_folder = os.path.join(output_path, "autointerp")
         os.makedirs(output_folder, exist_ok=True)
         
+        # Reduce batch size for large SAEs to avoid OOM, but keep 2M tokens
+        is_large_model = any(x in model_name.lower() for x in ["gemma", "llama", "mistral", "2b", "7b", "13b"])
+        autointerp_batch_size = max(4, llm_batch_size // 4) if is_large_model else llm_batch_size
+        
         config = autointerp.AutoInterpEvalConfig(
             model_name=model_name,
             random_seed=random_seed,
-            llm_batch_size=llm_batch_size,
+            llm_batch_size=autointerp_batch_size,
             llm_dtype=llm_dtype,
+            total_tokens=2_000_000,  # Keep at 2M tokens
+            n_latents=500,  # Reduce from 1000 to 500 for faster eval with large SAEs
         )
         
         return autointerp.run_eval(
@@ -389,10 +459,20 @@ def run_evaluations(
         output_folder = os.path.join(output_path, "ravel")
         os.makedirs(output_folder, exist_ok=True)
         
+        # RAVEL expects short model names (e.g., "gemma-2-2b" not "google/gemma-2-2b")
+        # Convert full HuggingFace path to short name
+        ravel_model_name = model_name
+        if "/" in model_name:
+            ravel_model_name = model_name.split("/")[-1]
+        
+        # Use very small batch for large SAEs to avoid OOM
+        is_large_model = any(x in model_name.lower() for x in ["gemma", "llama", "mistral", "2b", "7b", "13b"])
+        ravel_batch_size = 4 if is_large_model else max(1, llm_batch_size // 4)
+        
         config = ravel.RAVELEvalConfig(
-            model_name=model_name,
+            model_name=ravel_model_name,
             random_seed=random_seed,
-            llm_batch_size=max(1, llm_batch_size // 4),  # RAVEL needs smaller batch
+            llm_batch_size=ravel_batch_size,
             llm_dtype=llm_dtype,
         )
         
@@ -404,10 +484,41 @@ def run_evaluations(
             force_rerun=force_rerun,
         )
     
+    def run_sparse_probing_sae_probes():
+        if not HAS_SPARSE_PROBING_SAE_PROBES:
+            print("Warning: sparse_probing_sae_probes evaluation not available")
+            return None
+        
+        print("\n" + "="*60)
+        print("Running SPARSE PROBING (SAE Probes) evaluation - 140+ datasets")
+        print("="*60)
+        output_folder = os.path.join(output_path, "sparse_probing_sae_probes")
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Get the hook name from the first SAE
+        hook_name = selected_saes[0][1].cfg.hook_name if selected_saes else None
+        
+        config = sparse_probing_sae_probes.SparseProbingSaeProbesEvalConfig(
+            model_name=model_name,
+            ks=[1, 2, 5, 10],  # k values for sparse probing
+            include_llm_baseline=True,  # Compare against LLM residual stream baseline
+            results_path=os.path.join(output_path, "artifacts/sparse_probing_sae_probes"),
+            model_cache_path=os.path.join(output_path, "artifacts/sparse_probing_sae_probes--model_acts_cache"),
+        )
+        
+        return sparse_probing_sae_probes.run_eval(
+            config=config,
+            selected_saes=selected_saes,
+            device=device,
+            output_path=output_folder,
+            force_rerun=force_rerun,
+        )
+    
     # Mapping of eval types to runner functions
     eval_runners = {
         "core": run_core,
         "sparse_probing": run_sparse_probing,
+        "sparse_probing_sae_probes": run_sparse_probing_sae_probes,
         "scr": run_scr,
         "tpp": run_tpp,
         "absorption": run_absorption,
@@ -416,7 +527,7 @@ def run_evaluations(
     }
     
     # Run selected evaluations
-    for eval_type in tqdm(eval_types, desc="Running evaluations", dtype=str):
+    for eval_type in tqdm(eval_types, desc="Running evaluations"):
         if eval_type not in eval_runners:
             print(f"Warning: Unknown evaluation type '{eval_type}', skipping")
             continue
@@ -535,12 +646,30 @@ def main():
         description="Run SAEBench evaluations on SAEs trained with this codebase"
     )
     
-    # Required arguments
+    # Run identification - either wandb_run OR (project + run_name)
     parser.add_argument(
         "--wandb_run",
         type=str,
-        required=True,
+        default=None,
         help="Wandb run path: 'entity/project/run_id' or 'project/run_id'"
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="Wandb project name (required if using --run_name)"
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Wandb run display name (alternative to --wandb_run)"
+    )
+    parser.add_argument(
+        "--entity",
+        type=str,
+        default=None,
+        help="Wandb entity/username (uses WANDB_ENTITY from .env if not specified)"
     )
     
     # Evaluation selection
@@ -549,7 +678,7 @@ def main():
         type=str,
         nargs="+",
         default=["core", "sparse_probing"],
-        choices=["core", "sparse_probing", "scr", "tpp", "absorption", "autointerp", "ravel"],
+        choices=["core", "sparse_probing", "sparse_probing_sae_probes", "scr", "tpp", "absorption", "autointerp", "ravel"],
         help="Evaluation types to run (default: core sparse_probing)"
     )
     
@@ -657,8 +786,19 @@ def main():
                 api_key = f.read().strip()
             print(f"Loaded OpenAI API key from file: {args.api_key_file}")
     
+    # Determine wandb run path - either from --wandb_run or --run_name
+    if args.run_name:
+        if not args.project:
+            raise ValueError("--project is required when using --run_name")
+        entity = args.entity  # Will use settings.wandb_entity if None
+        wandb_run = find_run_by_name(args.project, args.run_name, entity)
+    elif args.wandb_run:
+        wandb_run = args.wandb_run
+    else:
+        raise ValueError("Either --wandb_run or (--project and --run_name) must be specified")
+    
     # Load SAE from wandb
-    sae_transformer, config, run_id = load_sae_from_wandb(args.wandb_run, device)
+    sae_transformer, config, run_id = load_sae_from_wandb(wandb_run, device)
     
     # Get model name - handle different config formats
     model_name = config.tlens_model_name
@@ -731,7 +871,7 @@ def main():
     if not args.skip_upload:
         upload_results_to_wandb(
             results=results,
-            wandb_run=args.wandb_run,
+            wandb_run=wandb_run,
             output_path=str(output_path),
             run_id=run_id,
         )

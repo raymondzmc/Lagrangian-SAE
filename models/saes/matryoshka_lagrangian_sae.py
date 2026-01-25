@@ -170,10 +170,11 @@ class MatryoshkaLagrangianSAEOutput(SAEOutput):
     """
     Matryoshka Lagrangian SAE output combining both paradigms.
     """
-    preacts: Float[torch.Tensor, "... c"]  # encoder outputs (after ReLU, before JumpReLU)
+    preacts: Float[torch.Tensor, "... c"]  # encoder outputs (before JumpReLU)
     l0: Float[torch.Tensor, "..."]  # L0 norm per sample (actual count)
     l0_differentiable: Float[torch.Tensor, "..."]  # Differentiable L0 for gradients
     alpha: torch.Tensor  # current Lagrangian multiplier value
+    norm_factor: torch.Tensor | None = None  # normalization factor for scale alignment in loss
     auxk_indices: torch.Tensor | None = None
     auxk_values: torch.Tensor | None = None
 
@@ -513,6 +514,7 @@ class MatryoshkaLagrangianSAE(BaseSAE):
             l0=l0,
             l0_differentiable=l0_differentiable,
             alpha=self.alpha,
+            norm_factor=norm_factor,
             auxk_indices=auxk_indices,
             auxk_values=auxk_values,
         )
@@ -545,7 +547,14 @@ class MatryoshkaLagrangianSAE(BaseSAE):
             
             x_reconstruct = x_reconstruct + F.linear(acts_slice, W_dec_slice)
             
-            group_mse = F.mse_loss(x_reconstruct, input_for_loss)
+            # Denormalize reconstruction before computing MSE (fixes scale mismatch)
+            # x_reconstruct is in normalized space, input_for_loss is in original space
+            if self.normalize_activations and output.norm_factor is not None:
+                x_reconstruct_denorm = x_reconstruct * output.norm_factor
+            else:
+                x_reconstruct_denorm = x_reconstruct
+            
+            group_mse = F.mse_loss(x_reconstruct_denorm, input_for_loss)
             group_losses.append(group_mse.detach().clone())
             
             total_mse_loss = total_mse_loss + self.group_weights[i] * group_mse

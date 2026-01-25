@@ -18,15 +18,14 @@ When comparing MatryoshkaLagrangianSAE with other SAE implementations, be aware
 of the following architectural differences that prevent direct apple-to-apple
 comparisons:
 
-1. ENCODER PRE-ACTIVATION (vs LagrangianSAE)
-   - MatryoshkaLagrangianSAE: Applies ReLU BEFORE JumpReLU
-     preacts = F.relu(self.encoder(x_enc) + self.encoder_bias)
-   - LagrangianSAE: No ReLU, passes raw encoder outputs to JumpReLU
+1. ENCODER PRE-ACTIVATION
+   - MatryoshkaLagrangianSAE: Same as LagrangianSAE (no ReLU before JumpReLU)
      preacts = self.encoder(x_enc) + self.encoder_bias
+   - MatryoshkaSAE: Applies ReLU before BatchTopK
+     preacts = F.relu(self.encoder(x_centered))
    
-   Impact: JumpReLU thresholds have different semantics. With ReLU, all preacts
-   are non-negative, changing how threshold values affect sparsity. The same
-   threshold value will yield different L0 levels between implementations.
+   Note: MatryoshkaLagrangianSAE matches LagrangianSAE's approach, NOT MatryoshkaSAE's.
+   This is necessary for proper threshold learning via the Lagrangian mechanism.
 
 2. NORMALIZATION APPROACH (vs MatryoshkaSAE)
    - MatryoshkaLagrangianSAE: Uses `normalize_activations` (scale-only)
@@ -458,8 +457,8 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         else:
             x_enc = x_normalized
 
-        # Encoder with ReLU pre-activation
-        preacts = F.relu(self.encoder(x_enc) + self.encoder_bias)
+        # Encoder pre-activations (no ReLU - matches LagrangianSAE for proper threshold learning)
+        preacts = self.encoder(x_enc) + self.encoder_bias
         
         # Threshold calibration on first batch
         if self.calibrate_thresholds and self.training and not self.thresholds_calibrated:

@@ -50,7 +50,8 @@ saes:
   init_decoder_orthogonal: true
   sparsity_coeff: null
   tied_encoder_init: true
-  use_pre_enc_bias: false
+  use_pre_enc_bias: true
+  normalize_activations: true
 
   # Matryoshka params (use defaults: 5 groups)
   # group_fractions: [0.03125, 0.0625, 0.125, 0.25, 0.53125]
@@ -65,8 +66,8 @@ saes:
   l0_ema_momentum: 0.99
   equality_constraint: false
   
-  # JumpReLU threshold parameters
-  initial_threshold: 0.5
+  # JumpReLU threshold parameters (matches LagrangianSAE for proper threshold learning)
+  initial_threshold: 0.001  # Fallback if calibration disabled; small value for normalized activations
   calibrate_thresholds: true
   bandwidth: 0.001
   

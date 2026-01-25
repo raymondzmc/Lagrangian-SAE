@@ -21,7 +21,6 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from datetime import datetime
 
 # Add project root to path for local imports
 project_root = Path(__file__).parent.absolute()
@@ -549,6 +548,7 @@ def upload_results_to_wandb(
     wandb_run: str,
     output_path: str,
     run_id: str,
+    run_name: str,
 ) -> None:
     """
     Upload evaluation results to the original wandb run as an artifact.
@@ -558,6 +558,7 @@ def upload_results_to_wandb(
         wandb_run: The wandb run path
         output_path: Path where results are saved
         run_id: The run ID
+        run_name: The display name of the run (used as artifact name)
     """
     print("\n" + "="*60)
     print("Uploading results to Wandb")
@@ -580,13 +581,13 @@ def upload_results_to_wandb(
         reinit=True,
     )
     
-    # Create artifact
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    artifact_name = f"saebench_results_{timestamp}"
+    # Create artifact with semantic name (run_name) for automatic versioning
+    artifact_name = run_name
+    eval_types_str = ", ".join(sorted(results.keys()))
     artifact = wandb.Artifact(
         name=artifact_name,
-        type="evaluation_results",
-        description="SAEBench evaluation results",
+        type="saebench-results",
+        description=f"SAEBench evaluation results: {eval_types_str}",
     )
     
     # Add result files to artifact
@@ -638,7 +639,7 @@ def upload_results_to_wandb(
         wandb.log(summary_metrics)
     
     wandb.finish()
-    print(f"Results uploaded as artifact: {artifact_name}")
+    print(f"Results uploaded as artifact: {artifact_name} (new version created)")
 
 
 def main():
@@ -792,8 +793,13 @@ def main():
             raise ValueError("--project is required when using --run_name")
         entity = args.entity  # Will use settings.wandb_entity if None
         wandb_run = find_run_by_name(args.project, args.run_name, entity)
+        run_name = args.run_name
     elif args.wandb_run:
         wandb_run = args.wandb_run
+        # Fetch run name from wandb API
+        api = wandb.Api()
+        run = api.run(wandb_run)
+        run_name = run.name
     else:
         raise ValueError("Either --wandb_run or (--project and --run_name) must be specified")
     
@@ -874,6 +880,7 @@ def main():
             wandb_run=wandb_run,
             output_path=str(output_path),
             run_id=run_id,
+            run_name=run_name,
         )
     
     print("\n" + "="*60)

@@ -5,7 +5,7 @@
 
 SESSION_PREFIX="gemma2_lagrangian"
 WORKDIR="/workspace/Lagrangian-SAE"
-VENV_CMD="source /venv/sae/bin/activate"
+VENV_CMD="conda activate sae"
 BASE_CONFIG="configs/gemma2-2b/gemma2-lagrangian.yaml"
 SWEEP_DIR="configs/gemma2-2b/sweep/lagrangian_sweeps"
 

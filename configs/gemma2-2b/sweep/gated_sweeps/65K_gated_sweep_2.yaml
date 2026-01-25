@@ -1,0 +1,3 @@
+wandb_project: "gemma2-2b-65K"
+sparsity_coeff: [0.024]
+n_dict_components: 65536

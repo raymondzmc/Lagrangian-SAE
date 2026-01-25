@@ -65,7 +65,7 @@ saes:
   # Threshold calibration (RECOMMENDED: auto-sets thresholds so initial L0 ≈ target_l0)
   calibrate_thresholds: true
   # Constraint type: true = equality (L0 ≈ target), false = inequality (L0 ≤ target)
-  equality_constraint: true
+  equality_constraint: false
   tied_encoder_init: true
   use_pre_enc_bias: true
   normalize_activations: true

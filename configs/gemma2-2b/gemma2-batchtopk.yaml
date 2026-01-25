@@ -14,7 +14,7 @@ torch_compile_mode: "reduce-overhead"
 # Training Configuration
 save_every_n_samples: 100_000
 eval_every_n_samples: 20_000
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 1
 lr: 3e-4
 lr_schedule: cosine
 min_lr_factor: 0.1

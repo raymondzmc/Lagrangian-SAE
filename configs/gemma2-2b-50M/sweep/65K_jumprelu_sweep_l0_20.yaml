@@ -1,6 +1,0 @@
-wandb_project: "gemma2-2b-65K-50M"
-target_l0: [20]
-sparsity_coeff: [1, 5, 10, 20, 50, 100]
-aux_coeff: [0, 0.03125]
-n_dict_components: 65536
-sparsity_warmup_steps: [1000]

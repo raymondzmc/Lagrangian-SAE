@@ -1,3 +1,0 @@
-wandb_project: "gemma2-2b-65K"
-k: [32, 64, 128, 256]
-n_dict_components: 65536

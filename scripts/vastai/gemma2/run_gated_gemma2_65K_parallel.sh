@@ -6,7 +6,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-SPARSITY_COEFFS=(0.012 0.018 0.024 0.04 0.06)
+SPARSITY_COEFFS=(0.009 0.008 0.013 0.019 0.025)
 
 for i in {0..4}; do
     SESSION_NAME="gated_sweep_$i"

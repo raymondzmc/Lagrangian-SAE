@@ -61,7 +61,8 @@ class MatryoshkaLagrangianSAEConfig(SAEConfig):
     target_l0: float = Field(..., description="Target L0 sparsity (number of active features per sample)")
     initial_alpha: float = Field(0.0, description="Initial alpha for Lagrangian multiplier")
     alpha_lr: float = Field(1e-2, description="Learning rate for alpha dual ascent")
-    alpha_max: float = Field(100.0, description="Maximum value for alpha to prevent instability")
+    alpha_max: float = Field(100.0, description="Maximum alpha when L0 > target (upper bound)")
+    alpha_min: float | None = Field(None, description="Maximum alpha magnitude when L0 < target (lower bound magnitude). If None, uses alpha_max for symmetric bounds.")
     rho_quadratic: float = Field(0.1, description="Coefficient for quadratic penalty in augmented Lagrangian")
     l0_ema_momentum: float = Field(0.99, description="Momentum for running mean of L0")
     equality_constraint: bool = Field(True, description="If True, enforce L0 ≈ target; if False, enforce L0 <= target")
@@ -145,6 +146,7 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         initial_alpha: float = 0.0,
         alpha_lr: float = 1e-2,
         alpha_max: float = 100.0,
+        alpha_min: float | None = None,
         rho_quadratic: float = 0.1,
         l0_ema_momentum: float = 0.99,
         equality_constraint: bool = True,
@@ -172,7 +174,8 @@ class MatryoshkaLagrangianSAE(BaseSAE):
             group_weights: Weights for loss at each group boundary (default: uniform).
             initial_alpha: Initial value for Lagrangian multiplier.
             alpha_lr: Learning rate for alpha dual ascent.
-            alpha_max: Maximum absolute value for alpha.
+            alpha_max: Maximum alpha when L0 > target (upper bound).
+            alpha_min: Maximum alpha magnitude when L0 < target. If None, uses alpha_max.
             rho_quadratic: Coefficient for quadratic penalty in augmented Lagrangian.
             l0_ema_momentum: Momentum for running mean of L0.
             equality_constraint: If True, enforce L0 ≈ target; if False, L0 <= target.
@@ -201,6 +204,8 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         self.target_l0 = target_l0
         self.alpha_lr = alpha_lr
         self.alpha_max = alpha_max
+        # alpha_min defaults to alpha_max for symmetric bounds; set smaller for asymmetric "soft inequality"
+        self.alpha_min = alpha_min if alpha_min is not None else alpha_max
         self.rho_quadratic = rho_quadratic
         self.l0_ema_momentum = l0_ema_momentum
         self.bandwidth = bandwidth
@@ -499,9 +504,15 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         # Update running L0 (EMA)
         if self.training:
             with torch.no_grad():
-                self.running_l0.mul_(self.l0_ema_momentum).add_(
-                    (1.0 - self.l0_ema_momentum) * mean_l0.detach()
+                # NOTE: Compute in float32 to avoid bfloat16 precision issues where EMA
+                # updates can get lost due to limited mantissa bits (e.g., 74.5 is a "sticky"
+                # value in bfloat16 where small updates round back to the same value)
+                running_l0_f32 = self.running_l0.float()
+                running_l0_f32 = (
+                    self.l0_ema_momentum * running_l0_f32
+                    + (1.0 - self.l0_ema_momentum) * mean_l0.detach().float()
                 )
+                self.running_l0.copy_(running_l0_f32)
         
         # Store constraint violation for dual ascent
         running_constraint_violation = self.running_l0 - self.target_l0
@@ -566,11 +577,14 @@ class MatryoshkaLagrangianSAE(BaseSAE):
         Perform dual ascent update on alpha.
         
         Should be called after optimizer.step() to avoid autograd conflicts.
+        
+        Uses asymmetric bounds [-alpha_min, +alpha_max] for equality constraint.
         """
         if hasattr(self, '_last_constraint_violation'):
             self.alpha.add_(self.alpha_lr * self._last_constraint_violation)
             if self.equality_constraint:
-                self.alpha.clamp_(min=-self.alpha_max, max=self.alpha_max)
+                # Asymmetric bounds: [-alpha_min, +alpha_max]
+                self.alpha.clamp_(min=-self.alpha_min, max=self.alpha_max)
             else:
                 self.alpha.clamp_(min=0, max=self.alpha_max)
 
@@ -582,3 +596,23 @@ class MatryoshkaLagrangianSAE(BaseSAE):
     @property
     def device(self):
         return next(self.parameters()).device
+    
+    def _apply(self, fn):
+        """Override _apply to keep control buffers (running_l0, alpha) in float32.
+        
+        When .to(dtype=bfloat16) is called, all buffers get converted to bfloat16.
+        However, running_l0 and alpha need float32 precision for EMA updates to work
+        correctly. In bfloat16, certain values like 74.5 are "sticky" where small
+        updates round back to the same value, causing the control system to fail.
+        """
+        # Apply the function to all parameters and buffers normally
+        super()._apply(fn)
+        
+        # Restore float32 precision for control buffers
+        # These buffers need full precision for accurate EMA and dual ascent updates
+        if hasattr(self, 'running_l0') and self.running_l0.dtype != torch.float32:
+            self.running_l0 = self.running_l0.float()
+        if hasattr(self, 'alpha') and self.alpha.dtype != torch.float32:
+            self.alpha = self.alpha.float()
+        
+        return self

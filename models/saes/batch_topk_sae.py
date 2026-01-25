@@ -183,7 +183,7 @@ class BatchTopKSAE(BaseSAE):
         
         # Reshape back to original shape
         acts_topk = acts_topk_flat.reshape(acts.shape)
-        mask = (acts_topk > 0).to(acts.dtype)
+        mask = (acts_topk > 0).float()
         
         return acts_topk, mask
 
@@ -209,6 +209,10 @@ class BatchTopKSAE(BaseSAE):
     def _apply_threshold(self, acts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply learned threshold during inference (JumpReLU-style).
         
+        NOTE: This method is DEPRECATED and should not be used.
+        The threshold-based approach doesn't preserve L_0 = k during inference.
+        Use _apply_per_sample_topk() instead.
+        
         Args:
             acts: Pre-activations (after ReLU, before sparsification)
             
@@ -221,6 +225,31 @@ class BatchTopKSAE(BaseSAE):
         mask = (acts > threshold).to(acts.dtype)
         acts_sparse = acts * mask
         return acts_sparse, mask
+
+    def _apply_per_sample_topk(self, acts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply per-sample Top-K selection during inference.
+        
+        This maintains consistent L_0 = k behavior between training and inference,
+        unlike the threshold-based approach which can result in variable L_0.
+        
+        Args:
+            acts: Pre-activations (after ReLU), shape (batch, dict_size)
+            
+        Returns:
+            acts_topk: Activations with only top-k values per sample
+            mask: Binary mask of active features
+        """
+        # Get top-k values and indices per sample
+        topk_values, topk_indices = torch.topk(acts, k=self.k, dim=-1)
+        
+        # Create sparse tensor with selected values
+        acts_topk = torch.zeros_like(acts)
+        acts_topk.scatter_(-1, topk_indices, topk_values)
+        
+        # Create mask (with ReLU, values are non-negative so > 0 works)
+        mask = (acts_topk > 0).float()
+        
+        return acts_topk, mask
 
     def forward(self, x: Float[torch.Tensor, "... dim"]) -> BatchTopKSAEOutput:
         """
@@ -243,16 +272,13 @@ class BatchTopKSAE(BaseSAE):
         # Encoder preactivations
         preacts = F.relu(self.encoder(x_centered))
         
-        # Apply sparsification: batch top-k during training, threshold during inference
+        # Apply batch top-k sparsification (same for training and inference)
+        # Using batch top-k for inference maintains consistency with training and gives better MSE
+        acts_topk, mask = self._apply_batch_topk(preacts, batch_size)
+        
+        # Update running threshold during training (kept for backwards compatibility/logging)
         if self.training:
-            # Batch-level Top-K sparsification
-            acts_topk, mask = self._apply_batch_topk(preacts, batch_size)
-            
-            # Update running threshold for inference
             self._update_running_threshold(acts_topk)
-        else:
-            # Use learned threshold during inference
-            acts_topk, mask = self._apply_threshold(preacts)
         
         # Update dead feature statistics
         update_dead_feature_stats(

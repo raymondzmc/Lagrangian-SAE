@@ -264,6 +264,68 @@ class TestAlphaDynamics:
         )
         print(f"✓ Alpha correctly clamped at 0 for inequality constraint: {sae.alpha.item()}")
 
+    def test_alpha_asymmetric_bounds(self, sae_config):
+        """
+        Test that alpha respects asymmetric bounds when alpha_min < alpha_max.
+        
+        With asymmetric bounds, the penalty for L0 < target is weaker than for L0 > target,
+        creating a "soft inequality" behavior.
+        """
+        sae_config = sae_config.copy()
+        sae_config["alpha_max"] = 10.0
+        sae_config["alpha_min"] = 2.0  # Asymmetric: weaker penalty when L0 < target
+        sae_config["equality_constraint"] = True
+        
+        sae = LagrangianSAE(**sae_config)
+        sae.train()
+        
+        # Test upper bound (alpha_max)
+        sae.alpha.fill_(9.0)
+        sae._last_constraint_violation = torch.tensor(100.0)  # Would push alpha to 19.0
+        sae.update_alpha()
+        
+        assert sae.alpha.item() == 10.0, (
+            f"Alpha should be clamped to alpha_max=10.0, got {sae.alpha.item()}"
+        )
+        print(f"✓ Alpha correctly clamped at upper bound (alpha_max): {sae.alpha.item()}")
+        
+        # Test lower bound (alpha_min, asymmetric)
+        sae.alpha.fill_(-1.0)
+        sae._last_constraint_violation = torch.tensor(-100.0)  # Would push alpha to -11.0
+        sae.update_alpha()
+        
+        assert sae.alpha.item() == -2.0, (
+            f"Alpha should be clamped to -alpha_min=-2.0 (asymmetric), got {sae.alpha.item()}"
+        )
+        print(f"✓ Alpha correctly clamped at lower bound (-alpha_min): {sae.alpha.item()}")
+
+    def test_alpha_symmetric_bounds_default(self, sae_config):
+        """
+        Test that alpha_min defaults to alpha_max for symmetric bounds (backward compatibility).
+        """
+        sae_config = sae_config.copy()
+        sae_config["alpha_max"] = 5.0
+        # alpha_min not specified - should default to alpha_max
+        sae_config["equality_constraint"] = True
+        
+        sae = LagrangianSAE(**sae_config)
+        sae.train()
+        
+        # Verify alpha_min defaults to alpha_max
+        assert sae.alpha_min == sae.alpha_max == 5.0, (
+            f"alpha_min should default to alpha_max, got alpha_min={sae.alpha_min}, alpha_max={sae.alpha_max}"
+        )
+        
+        # Test that bounds are symmetric
+        sae.alpha.fill_(-4.0)
+        sae._last_constraint_violation = torch.tensor(-100.0)  # Would push alpha to -14.0
+        sae.update_alpha()
+        
+        assert sae.alpha.item() == -5.0, (
+            f"Alpha should be clamped to -alpha_max=-5.0 (symmetric), got {sae.alpha.item()}"
+        )
+        print(f"✓ Alpha correctly uses symmetric bounds when alpha_min not specified: {sae.alpha.item()}")
+
     def test_alpha_dynamics_over_training_steps(self, sae_config):
         """
         Test alpha dynamics over multiple training steps.
@@ -399,6 +461,140 @@ class TestAlphaIntegrationWithForward:
             print("  ✓ L0 ≈ target, alpha change minimal")
 
 
+class TestBfloat16Precision:
+    """Tests verifying EMA updates work correctly in bfloat16 precision."""
+    
+    def test_running_l0_updates_in_bfloat16(self):
+        """
+        Verify running_l0 EMA updates correctly even when model is in bfloat16.
+        
+        This tests the fix for the issue where running_l0 would get stuck at
+        "sticky" bfloat16 values like 74.5, where the EMA update is too small
+        to overcome the limited precision and rounds back to the same value.
+        """
+        sae = LagrangianSAE(
+            input_size=64,
+            n_dict_components=256,
+            target_l0=16.0,
+            initial_alpha=0.0,
+            alpha_lr=0.01,
+            alpha_max=5.0,
+            l0_ema_momentum=0.99,  # High momentum like production config
+            initial_threshold=0.5,
+            bandwidth=0.1,
+            calibrate_thresholds=False,
+        )
+        
+        # Convert to bfloat16 (this is what happens in production)
+        sae = sae.to(dtype=torch.bfloat16)
+        sae.train()
+        
+        # Set running_l0 to a known "sticky" bfloat16 value
+        # In bfloat16, values around 74.5 have limited precision (~0.5)
+        # and EMA updates can round back to the same value
+        initial_running_l0 = 74.5
+        sae.running_l0.fill_(initial_running_l0)
+        
+        print(f"\nTesting bfloat16 EMA precision fix:")
+        print(f"  Initial running_l0: {sae.running_l0.item():.4f}")
+        print(f"  Target L0: 16.0")
+        print(f"  EMA momentum: 0.99")
+        
+        # Simulate multiple training steps with actual L0 much lower than running_l0
+        target_actual_l0 = 42.0  # Actual L0 from the batch
+        
+        for step in range(100):
+            # Create mock output with controlled L0
+            x = torch.randn(32, 64, dtype=torch.bfloat16)
+            output = sae(x)
+            
+            # Override l0 to simulate consistent actual L0
+            # This mimics what happens in production when L0 is stable
+            with torch.no_grad():
+                output.l0.fill_(target_actual_l0)
+            
+            loss_output = sae.compute_loss(output)
+            
+            if step % 20 == 0:
+                print(f"  Step {step}: running_l0 = {sae.running_l0.item():.4f}")
+        
+        final_running_l0 = sae.running_l0.item()
+        print(f"  Final running_l0: {final_running_l0:.4f}")
+        
+        # After 100 EMA updates with momentum=0.99, running_l0 should have moved
+        # significantly toward target_actual_l0 (42.0)
+        # With correct float32 computation:
+        #   running_l0(100) ≈ 0.99^100 * (74.5 - 42) + 42 ≈ 0.366 * 32.5 + 42 ≈ 53.9
+        # Without the fix (stuck in bfloat16): running_l0 stays at 74.5
+        
+        assert final_running_l0 < 60.0, (
+            f"running_l0 should decrease significantly from {initial_running_l0} toward {target_actual_l0}, "
+            f"but got {final_running_l0:.4f}. This suggests EMA update is not working in bfloat16."
+        )
+        
+        # Also verify it moved in the correct direction
+        assert final_running_l0 < initial_running_l0, (
+            f"running_l0 should decrease when actual L0 ({target_actual_l0}) < running_l0 ({initial_running_l0})"
+        )
+        
+        print("  ✓ running_l0 correctly updated in bfloat16 mode")
+    
+    def test_running_l0_not_stuck_at_sticky_values(self):
+        """
+        Test that running_l0 doesn't get stuck at various "sticky" bfloat16 values.
+        
+        In bfloat16, certain values have limited precision where small EMA updates
+        round back to the same value. This test checks several such values.
+        """
+        sticky_values = [32.0, 64.0, 74.5, 96.0, 128.0]
+        target_l0 = 42.0
+        
+        print(f"\nTesting multiple sticky bfloat16 values:")
+        
+        for sticky_val in sticky_values:
+            sae = LagrangianSAE(
+                input_size=64,
+                n_dict_components=256,
+                target_l0=16.0,
+                initial_alpha=0.0,
+                alpha_lr=0.01,
+                alpha_max=5.0,
+                l0_ema_momentum=0.99,
+                initial_threshold=0.5,
+                bandwidth=0.1,
+                calibrate_thresholds=False,
+            )
+            sae = sae.to(dtype=torch.bfloat16)
+            sae.train()
+            
+            sae.running_l0.fill_(sticky_val)
+            initial_val = sae.running_l0.item()
+            
+            # Simulate 50 EMA updates
+            for _ in range(50):
+                x = torch.randn(32, 64, dtype=torch.bfloat16)
+                output = sae(x)
+                with torch.no_grad():
+                    output.l0.fill_(target_l0)
+                sae.compute_loss(output)
+            
+            final_val = sae.running_l0.item()
+            
+            # Verify running_l0 moved toward target
+            if sticky_val > target_l0:
+                assert final_val < sticky_val, (
+                    f"running_l0 stuck at {sticky_val} (got {final_val:.4f}), "
+                    f"should decrease toward {target_l0}"
+                )
+            elif sticky_val < target_l0:
+                assert final_val > sticky_val, (
+                    f"running_l0 stuck at {sticky_val} (got {final_val:.4f}), "
+                    f"should increase toward {target_l0}"
+                )
+            
+            print(f"  {sticky_val:6.1f} -> {final_val:6.2f} (target: {target_l0}) ✓")
+
+
 if __name__ == "__main__":
     print("Running alpha dynamics tests...\n")
     
@@ -440,6 +636,16 @@ if __name__ == "__main__":
     print("Test 7: Full training step integration")
     print("=" * 60)
     TestAlphaIntegrationWithForward().test_full_training_step_alpha_update()
+    
+    print("\n" + "=" * 60)
+    print("Test 8: Bfloat16 EMA precision (running_l0 updates)")
+    print("=" * 60)
+    TestBfloat16Precision().test_running_l0_updates_in_bfloat16()
+    
+    print("\n" + "=" * 60)
+    print("Test 9: Bfloat16 sticky values")
+    print("=" * 60)
+    TestBfloat16Precision().test_running_l0_not_stuck_at_sticky_values()
     
     print("\n" + "=" * 60)
     print("All tests passed!")

@@ -43,8 +43,9 @@ class LagrangianSAEConfig(SAEConfig):
     - Differentiable L0 approximation for gradient computation  
     - Dual ascent on alpha to achieve target sparsity
     - Supports two constraint modes via `equality_constraint`:
-      - True (default): Equality constraint (L0 ≈ target_l0), alpha in [-max, max]
-      - False: Inequality constraint (L0 ≤ target_l0), alpha in [0, max]
+      - True (default): Equality constraint (L0 ≈ target_l0), alpha in [-alpha_min, alpha_max]
+      - False: Inequality constraint (L0 ≤ target_l0), alpha in [0, alpha_max]
+    - Supports asymmetric bounds via `alpha_min` for "soft inequality" behavior
     - Uses running mean (EMA) of L0 for stable constraint evaluation
     - Comparable to TopK/BatchTopK for analyzing global expected L0
     """
@@ -53,7 +54,8 @@ class LagrangianSAEConfig(SAEConfig):
     initial_alpha: float = Field(0.0, description="Initial alpha for Lagrangian multiplier (can be positive or negative)")
     alpha_lr: float = Field(1e-2, description="Learning rate for alpha dual ascent")
     alpha_lr_down: float | None = Field(None, description="Unused for equality constraint (kept for backward compatibility)")
-    alpha_max: float = Field(100.0, description="Maximum value for alpha to prevent instability")
+    alpha_max: float = Field(100.0, description="Maximum alpha when L0 > target (upper bound)")
+    alpha_min: float | None = Field(None, description="Maximum alpha magnitude when L0 < target (lower bound magnitude). If None, uses alpha_max for symmetric bounds. Set smaller than alpha_max for asymmetric 'soft inequality' behavior.")
     tied_encoder_init: bool = Field(True, description="Initialize encoder as decoder.T")
     use_pre_enc_bias: bool = Field(False, description="Subtract decoder bias before encoding")
     
@@ -118,12 +120,16 @@ class LagrangianSAE(BaseSAE):
     Equality constraint (equality_constraint=True, default):
         min_θ E[MSE(x, x̂)]  s.t. E[L0(c)] = target_l0
         L = MSE + α · (L0_diff - target) + ρ/2 · (L0 - target)²
-        α ← α + α_lr · (L0 - target_l0), α ∈ [-α_max, α_max]
+        α ← α + α_lr · (L0 - target_l0), α ∈ [-α_min, α_max]
         
     Inequality constraint (equality_constraint=False):
         min_θ E[MSE(x, x̂)]  s.t. E[L0(c)] ≤ target_l0
         L = MSE + α · max(0, L0_diff - target) + ρ/2 · max(0, L0 - target)²
         α ← α + α_lr · (L0 - target_l0), α ∈ [0, α_max]
+    
+    Asymmetric bounds (alpha_min < alpha_max):
+        Creates "soft inequality" behavior where L0 > target is penalized more
+        strongly than L0 < target. Default: alpha_min = alpha_max (symmetric).
     
     Unlike fixed-threshold approaches, this SAE learns per-feature thresholds,
     allowing each dictionary element to find its optimal activation threshold.
@@ -138,6 +144,7 @@ class LagrangianSAE(BaseSAE):
         alpha_lr: float = 1e-2,
         alpha_lr_down: float | None = None,
         alpha_max: float = 100.0,
+        alpha_min: float | None = None,
         rho_quadratic: float = 0.1,
         l0_ema_momentum: float = 0.99,
         initial_threshold: float = 0.5,
@@ -162,8 +169,11 @@ class LagrangianSAE(BaseSAE):
             target_l0: Target number of active features per sample.
             initial_alpha: Initial value for Lagrangian multiplier (can be positive or negative).
             alpha_lr: Learning rate for alpha dual ascent.
-            alpha_lr_down: Unused for equality constraint (kept for backward compatibility).
-            alpha_max: Maximum absolute value for alpha (clamped to [-alpha_max, alpha_max]).
+            alpha_lr_down: Unused (kept for backward compatibility).
+            alpha_max: Maximum alpha when L0 > target (upper bound).
+            alpha_min: Maximum alpha magnitude when L0 < target (lower bound magnitude).
+                       If None, uses alpha_max for symmetric bounds. Set smaller than
+                       alpha_max for asymmetric "soft inequality" behavior.
             rho_quadratic: Coefficient for quadratic penalty in augmented Lagrangian.
             l0_ema_momentum: Momentum for running mean of L0 (0.99 = smooth, 0.0 = no smoothing).
             initial_threshold: Initial per-feature threshold value (fallback if calibration disabled).
@@ -193,9 +203,11 @@ class LagrangianSAE(BaseSAE):
         self.n_dict_components = n_dict_components
         self.target_l0 = target_l0
         self.alpha_lr = alpha_lr
-        # Use asymmetric LR: slower descent to prevent L0 undershoot when alpha approaches 0
+        # alpha_lr_down is unused but kept for backward compatibility
         self.alpha_lr_down = alpha_lr_down if alpha_lr_down is not None else 0.1 * alpha_lr
         self.alpha_max = alpha_max
+        # alpha_min defaults to alpha_max for symmetric bounds; set smaller for asymmetric "soft inequality"
+        self.alpha_min = alpha_min if alpha_min is not None else alpha_max
         self.rho_quadratic = rho_quadratic
         self.l0_ema_momentum = l0_ema_momentum
         self.bandwidth = bandwidth
@@ -481,9 +493,15 @@ class LagrangianSAE(BaseSAE):
         if self.training:
             with torch.no_grad():
                 # EMA update: running_l0 = momentum * running_l0 + (1 - momentum) * batch_l0
-                self.running_l0.mul_(self.l0_ema_momentum).add_(
-                    (1.0 - self.l0_ema_momentum) * mean_l0.detach()
+                # NOTE: Compute in float32 to avoid bfloat16 precision issues where EMA
+                # updates can get lost due to limited mantissa bits (e.g., 74.5 is a "sticky"
+                # value in bfloat16 where small updates round back to the same value)
+                running_l0_f32 = self.running_l0.float()
+                running_l0_f32 = (
+                    self.l0_ema_momentum * running_l0_f32
+                    + (1.0 - self.l0_ema_momentum) * mean_l0.detach().float()
                 )
+                self.running_l0.copy_(running_l0_f32)
         
         # Use RUNNING L0 for dual ascent (smoother updates)
         running_constraint_violation = self.running_l0 - self.target_l0
@@ -553,8 +571,9 @@ class LagrangianSAE(BaseSAE):
         Update rule: α ← α + α_lr · (L0 - target_l0)
         
         Clamping depends on constraint type:
-        - Equality (equality_constraint=True, default): α ∈ [-α_max, α_max]
+        - Equality (equality_constraint=True, default): α ∈ [-α_min, α_max]
           Alpha can be negative to incentivize more features when L0 < target.
+          Use alpha_min < alpha_max for asymmetric "soft inequality" behavior.
         - Inequality (equality_constraint=False): α ∈ [0, α_max]
           Alpha is non-negative; only penalizes when L0 > target.
         """
@@ -564,7 +583,8 @@ class LagrangianSAE(BaseSAE):
             # Clamp alpha based on constraint type
             if self.equality_constraint:
                 # Equality: alpha can be negative (to incentivize more active features)
-                self.alpha.clamp_(min=-self.alpha_max, max=self.alpha_max)
+                # Uses asymmetric bounds [-alpha_min, +alpha_max] for "soft inequality" when alpha_min < alpha_max
+                self.alpha.clamp_(min=-self.alpha_min, max=self.alpha_max)
             else:
                 # Inequality: alpha must be non-negative (only penalizes, never incentivizes)
                 self.alpha.clamp_(min=0, max=self.alpha_max)
@@ -580,3 +600,23 @@ class LagrangianSAE(BaseSAE):
     @property
     def device(self):
         return next(self.parameters()).device
+    
+    def _apply(self, fn):
+        """Override _apply to keep control buffers (running_l0, alpha) in float32.
+        
+        When .to(dtype=bfloat16) is called, all buffers get converted to bfloat16.
+        However, running_l0 and alpha need float32 precision for EMA updates to work
+        correctly. In bfloat16, certain values like 74.5 are "sticky" where small
+        updates round back to the same value, causing the control system to fail.
+        """
+        # Apply the function to all parameters and buffers normally
+        super()._apply(fn)
+        
+        # Restore float32 precision for control buffers
+        # These buffers need full precision for accurate EMA and dual ascent updates
+        if hasattr(self, 'running_l0') and self.running_l0.dtype != torch.float32:
+            self.running_l0 = self.running_l0.float()
+        if hasattr(self, 'alpha') and self.alpha.dtype != torch.float32:
+            self.alpha = self.alpha.float()
+        
+        return self

@@ -1,4 +1,5 @@
 wandb_project: "gemma2-2b-65K"
 target_l0: [128]
 alpha_max: [10]
+l0_ema_momentum: [0.9]
 n_dict_components: 65536

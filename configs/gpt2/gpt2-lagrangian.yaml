@@ -61,7 +61,7 @@ saes:
   rho_quadratic: 0.001  # Quadratic penalty coefficient (no normalization, so keep small)
   # Per-feature learned threshold parameters (like JumpReLU)
   initial_threshold: 0.001  # Fallback threshold if calibration is disabled
-  bandwidth: 0.001  # Bandwidth for gradient approximation (larger = more gradient signal to thresholds)
+  bandwidth: 0.01  # Bandwidth for gradient approximation (larger = more gradient signal to thresholds)
   # Threshold calibration (RECOMMENDED: auto-sets thresholds so initial L0 ≈ target_l0)
   calibrate_thresholds: true
   # Constraint type: true = equality (L0 ≈ target), false = inequality (L0 ≤ target)

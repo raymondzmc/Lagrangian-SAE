@@ -277,18 +277,49 @@ def find_run_by_name(project: str, run_name: str, entity: str | None = None) -> 
     return full_path
 
 
-def load_sae_from_wandb(wandb_run: str, device: torch.device) -> tuple[SAETransformer, Config, str]:
+def load_eval_config(config_path: str) -> dict:
+    """
+    Load EVAL_RUNS from a Python config file.
+    
+    Args:
+        config_path: Path to the Python config file containing EVAL_RUNS dict
+        
+    Returns:
+        Dictionary mapping sparsity_level -> method -> run_config
+        where run_config has 'run_name' and optionally 'checkpoint_step'
+    """
+    import importlib.util
+    
+    spec = importlib.util.spec_from_file_location("eval_config", config_path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Could not load config from {config_path}")
+    
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    
+    if not hasattr(module, 'EVAL_RUNS'):
+        raise ValueError(f"Config file {config_path} must define EVAL_RUNS dict")
+    
+    return module.EVAL_RUNS
+
+
+def load_sae_from_wandb(wandb_run: str, device: torch.device, checkpoint_step: int | None = None) -> tuple[SAETransformer, Config, str]:
     """
     Load an SAE from a wandb run.
     
     Args:
         wandb_run: The wandb run path (e.g., "entity/project/run_id")
         device: The device to load the model on
+        checkpoint_step: Optional step number to load a specific checkpoint.
+            If None, loads the latest (highest step) checkpoint.
         
     Returns:
         Tuple of (SAETransformer model, Config, run_id)
     """
-    print(f"Loading SAE from wandb run: {wandb_run}")
+    if checkpoint_step is not None:
+        print(f"Loading SAE from wandb run: {wandb_run} (checkpoint step: {checkpoint_step})")
+    else:
+        print(f"Loading SAE from wandb run: {wandb_run} (latest checkpoint)")
     
     # Parse wandb path
     parts = wandb_run.split("/")
@@ -303,7 +334,7 @@ def load_sae_from_wandb(wandb_run: str, device: torch.device) -> tuple[SAETransf
         raise ValueError(f"Invalid wandb_run format: {wandb_run}. Expected 'entity/project/run_id' or 'project/run_id'")
     
     # Load the model from wandb
-    sae_transformer = SAETransformer.from_wandb(project_run).to(device)
+    sae_transformer = SAETransformer.from_wandb(project_run, checkpoint_step=checkpoint_step).to(device)
     sae_transformer.saes.eval()
     
     # Get run config
@@ -780,6 +811,35 @@ def main():
         default=None,
         help="Wandb entity/username (uses WANDB_ENTITY from .env if not specified)"
     )
+    parser.add_argument(
+        "--checkpoint_step",
+        type=int,
+        default=None,
+        help="Specific checkpoint step to load (e.g., 30000). If not specified, loads the latest checkpoint."
+    )
+    
+    # Batch evaluation config
+    parser.add_argument(
+        "--eval_config",
+        type=str,
+        default=None,
+        help="Path to Python config file with EVAL_RUNS dict (alternative to --run_name). "
+             "See eval_config.py for example format."
+    )
+    parser.add_argument(
+        "--sparsity_levels",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Sparsity levels to evaluate from config (e.g., 32 64). If not specified, evaluates all."
+    )
+    parser.add_argument(
+        "--methods",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Methods to evaluate from config (e.g., lagrangian jumprelu). If not specified, evaluates all."
+    )
     
     # Evaluation selection
     parser.add_argument(
@@ -895,155 +955,253 @@ def main():
                 api_key = f.read().strip()
             print(f"Loaded OpenAI API key from file: {args.api_key_file}")
     
-    # Determine wandb run path - either from --wandb_run or --run_name
-    if args.run_name:
+    # Helper function to evaluate a single run
+    def evaluate_single_run(
+        run_name: str,
+        checkpoint_step: int | None,
+        entity: str,
+        project: str,
+        run_output_path: Path,
+    ):
+        """Evaluate a single SAE run."""
+        # Find the wandb run
+        wandb_run = find_run_by_name(project, run_name, entity)
+        
+        # Load SAE from wandb
+        sae_transformer, config, run_id = load_sae_from_wandb(wandb_run, device, checkpoint_step=checkpoint_step)
+        
+        # Get model name - handle different config formats
+        model_name = config.tlens_model_name
+        if model_name is None and config.tlens_model_path is not None:
+            model_name = str(config.tlens_model_path).split("/")[-1].replace(".pt", "")
+        
+        ckpt_info = f" (checkpoint: {checkpoint_step})" if checkpoint_step else " (latest checkpoint)"
+        print(f"\nLoaded SAE from run: {run_id}{ckpt_info}")
+        print(f"Model: {model_name}")
+        print(f"SAE type: {config.saes.sae_type}")
+        print(f"SAE positions: {sae_transformer.raw_sae_positions}")
+        
+        # Determine training tokens from config if not specified
+        training_tokens = args.training_tokens
+        if training_tokens < 0 and config.data.n_train_samples is not None:
+            context_length = getattr(config.data, 'context_length', 128)
+            training_tokens = config.data.n_train_samples * context_length
+        
+        # Determine dtype for wrapper
+        dtype_str = args.llm_dtype or get_model_config(model_name)["dtype"]
+        dtype = general_utils.str_to_dtype(dtype_str)
+        
+        # Create SAEBench wrappers
+        print("\nCreating SAEBench wrappers...")
+        selected_saes = create_saebench_saes_from_transformer(
+            sae_transformer=sae_transformer,
+            config=config,
+            device=device,
+            dtype=dtype,
+            training_tokens=training_tokens,
+        )
+        
+        print(f"Created {len(selected_saes)} SAE wrappers:")
+        for sae_id, sae in selected_saes:
+            print(f"  - {sae_id}: d_in={sae.cfg.d_in}, d_sae={sae.cfg.d_sae}")
+        
+        # Determine whether to save activations
+        save_activations = not args.no_save_activations
+        
+        # Smart re-run logic
+        existing_results = {}
+        evals_to_run = args.eval_types
+        
+        if not args.force_rerun:
+            print("\n" + "="*60)
+            print("CHECKING FOR EXISTING RESULTS")
+            print("="*60)
+            
+            existing_results = download_existing_results(
+                run_name=run_name,
+                output_path=str(run_output_path),
+                entity=entity,
+                project=project,
+            )
+            
+            print("\nDetermining which evaluations need to run:")
+            evals_to_run = get_missing_evals(
+                requested_evals=args.eval_types,
+                existing_results=existing_results,
+                output_path=str(run_output_path),
+            )
+            
+            if not evals_to_run:
+                print("\nAll requested evaluations already have results!")
+                print("Use --force_rerun to re-run anyway.")
+            else:
+                print(f"\nWill run {len(evals_to_run)} evaluation(s): {', '.join(evals_to_run)}")
+        else:
+            print("\n--force_rerun specified, will run all requested evaluations")
+        
+        # Run evaluations
+        new_results = {}
+        if evals_to_run:
+            new_results = run_evaluations(
+                selected_saes=selected_saes,
+                model_name=model_name,
+                eval_types=evals_to_run,
+                device=args.device,
+                output_path=str(run_output_path),
+                llm_batch_size=args.llm_batch_size,
+                llm_dtype=args.llm_dtype,
+                api_key=api_key,
+                force_rerun=args.force_rerun,
+                save_activations=save_activations,
+                random_seed=args.random_seed,
+            )
+        
+        # Merge results
+        all_results = {**existing_results, **new_results}
+        
+        # Print summary
+        print("\n" + "="*60)
+        print("EVALUATION SUMMARY")
+        print("="*60)
+        for eval_type, result in all_results.items():
+            status = "(NEW)" if eval_type in new_results else "(EXISTING)"
+            print(f"\n{eval_type} {status}:")
+            if isinstance(result, dict):
+                for k, v in result.items():
+                    if isinstance(v, (int, float)):
+                        print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+                    elif isinstance(v, torch.Tensor) and v.numel() == 1:
+                        print(f"  {k}: {v.item():.4f}")
+        
+        # Upload results
+        if not args.skip_upload and (new_results or args.force_rerun):
+            upload_results_to_wandb(
+                results=all_results,
+                wandb_run=wandb_run,
+                output_path=str(run_output_path),
+                run_id=run_id,
+                run_name=run_name,
+            )
+        elif not args.skip_upload and not new_results:
+            print("\nNo new results to upload (all evaluations were cached)")
+        
+        print("\n" + "="*60)
+        print("EVALUATION COMPLETE")
+        print("="*60)
+        print(f"Results saved to: {run_output_path}")
+        
+        return all_results
+    
+    # Determine evaluation mode: batch config vs single run
+    if args.eval_config:
+        # Batch evaluation mode
         if not args.project:
-            raise ValueError("--project is required when using --run_name")
+            raise ValueError("--project is required when using --eval_config")
+        
         entity = args.entity or settings.wandb_entity
         project = args.project
-        wandb_run = find_run_by_name(project, args.run_name, entity)
-        run_name = args.run_name
-    elif args.wandb_run:
-        wandb_run = args.wandb_run
-        # Parse entity and project from wandb_run path
-        parts = wandb_run.split("/")
-        if len(parts) == 3:
-            entity, project, _ = parts
-        else:
-            entity = settings.wandb_entity
-            project = parts[0] if len(parts) >= 1 else None
-        # Fetch run name from wandb API
-        api = wandb.Api()
-        run = api.run(wandb_run)
-        run_name = run.name
-    else:
-        raise ValueError("Either --wandb_run or (--project and --run_name) must be specified")
-    
-    # Load SAE from wandb
-    sae_transformer, config, run_id = load_sae_from_wandb(wandb_run, device)
-    
-    # Get model name - handle different config formats
-    model_name = config.tlens_model_name
-    if model_name is None and config.tlens_model_path is not None:
-        # Extract model name from path if needed
-        model_name = str(config.tlens_model_path).split("/")[-1].replace(".pt", "")
-    
-    print(f"\nLoaded SAE from run: {run_id}")
-    print(f"Model: {model_name}")
-    print(f"SAE type: {config.saes.sae_type}")
-    print(f"SAE positions: {sae_transformer.raw_sae_positions}")
-    
-    # Determine training tokens from config if not specified
-    training_tokens = args.training_tokens
-    if training_tokens < 0 and config.data.n_train_samples is not None:
-        # Estimate training tokens from samples and context length
-        context_length = getattr(config.data, 'context_length', 128)
-        training_tokens = config.data.n_train_samples * context_length
-    
-    # Determine dtype for wrapper
-    dtype_str = args.llm_dtype or get_model_config(model_name)["dtype"]
-    dtype = general_utils.str_to_dtype(dtype_str)
-    
-    # Create SAEBench wrappers
-    print("\nCreating SAEBench wrappers...")
-    selected_saes = create_saebench_saes_from_transformer(
-        sae_transformer=sae_transformer,
-        config=config,
-        device=device,
-        dtype=dtype,
-        training_tokens=training_tokens,
-    )
-    
-    print(f"Created {len(selected_saes)} SAE wrappers:")
-    for sae_id, sae in selected_saes:
-        print(f"  - {sae_id}: d_in={sae.cfg.d_in}, d_sae={sae.cfg.d_sae}")
-    
-    # Determine whether to save activations (default True, unless --no_save_activations)
-    save_activations = not args.no_save_activations
-    
-    # Smart re-run logic: check for existing results and only run missing evals
-    existing_results = {}
-    evals_to_run = args.eval_types
-    
-    if not args.force_rerun:
-        print("\n" + "="*60)
-        print("CHECKING FOR EXISTING RESULTS")
-        print("="*60)
         
-        # Try to download existing results from wandb artifact
-        existing_results = download_existing_results(
+        # Load the evaluation config
+        print("\n" + "="*60)
+        print("BATCH EVALUATION MODE")
+        print("="*60)
+        print(f"Loading config from: {args.eval_config}")
+        
+        eval_runs = load_eval_config(args.eval_config)
+        
+        # Filter by sparsity levels if specified
+        if args.sparsity_levels:
+            eval_runs = {k: v for k, v in eval_runs.items() if k in args.sparsity_levels}
+            print(f"Filtering to sparsity levels: {args.sparsity_levels}")
+        
+        # Count total runs
+        total_runs = 0
+        for sparsity, methods in eval_runs.items():
+            # Filter by methods if specified
+            if args.methods:
+                methods = {k: v for k, v in methods.items() if k in args.methods}
+            total_runs += len(methods)
+        
+        print(f"Total runs to evaluate: {total_runs}")
+        
+        # Iterate over all runs
+        run_idx = 0
+        all_batch_results = {}
+        
+        for sparsity_level in sorted(eval_runs.keys()):
+            methods = eval_runs[sparsity_level]
+            
+            # Filter by methods if specified
+            if args.methods:
+                methods = {k: v for k, v in methods.items() if k in args.methods}
+            
+            for method_name, run_config in methods.items():
+                run_idx += 1
+                run_name = run_config["run_name"]
+                checkpoint_step = run_config.get("checkpoint_step")
+                
+                print("\n" + "#"*80)
+                print(f"# RUN {run_idx}/{total_runs}: L0={sparsity_level}, Method={method_name}")
+                print(f"# Run name: {run_name}")
+                if checkpoint_step:
+                    print(f"# Checkpoint step: {checkpoint_step}")
+                print("#"*80)
+                
+                # Create output path: base/L0_{sparsity}/{method}/
+                run_output_path = output_path / f"L0_{sparsity_level}" / method_name
+                run_output_path.mkdir(parents=True, exist_ok=True)
+                
+                try:
+                    results = evaluate_single_run(
+                        run_name=run_name,
+                        checkpoint_step=checkpoint_step,
+                        entity=entity,
+                        project=project,
+                        run_output_path=run_output_path,
+                    )
+                    all_batch_results[(sparsity_level, method_name)] = results
+                except Exception as e:
+                    print(f"\nERROR evaluating {run_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+        
+        # Print batch summary
+        print("\n" + "="*80)
+        print("BATCH EVALUATION COMPLETE")
+        print("="*80)
+        print(f"Successfully evaluated: {len(all_batch_results)}/{total_runs} runs")
+        print(f"Results saved to: {output_path}")
+        
+    else:
+        # Single run mode (original behavior)
+        if args.run_name:
+            if not args.project:
+                raise ValueError("--project is required when using --run_name")
+            entity = args.entity or settings.wandb_entity
+            project = args.project
+            run_name = args.run_name
+        elif args.wandb_run:
+            wandb_run = args.wandb_run
+            parts = wandb_run.split("/")
+            if len(parts) == 3:
+                entity, project, _ = parts
+            else:
+                entity = settings.wandb_entity
+                project = parts[0] if len(parts) >= 1 else None
+            api = wandb.Api()
+            run = api.run(wandb_run)
+            run_name = run.name
+        else:
+            raise ValueError("Either --wandb_run, --run_name, or --eval_config must be specified")
+        
+        evaluate_single_run(
             run_name=run_name,
-            output_path=str(output_path),
+            checkpoint_step=args.checkpoint_step,
             entity=entity,
             project=project,
+            run_output_path=output_path,
         )
-        
-        # Determine which evals need to run
-        print("\nDetermining which evaluations need to run:")
-        evals_to_run = get_missing_evals(
-            requested_evals=args.eval_types,
-            existing_results=existing_results,
-            output_path=str(output_path),
-        )
-        
-        if not evals_to_run:
-            print("\nAll requested evaluations already have results!")
-            print("Use --force_rerun to re-run anyway.")
-        else:
-            print(f"\nWill run {len(evals_to_run)} evaluation(s): {', '.join(evals_to_run)}")
-    else:
-        print("\n--force_rerun specified, will run all requested evaluations")
-    
-    # Run evaluations (only the ones that need to run)
-    new_results = {}
-    if evals_to_run:
-        new_results = run_evaluations(
-            selected_saes=selected_saes,
-            model_name=model_name,
-            eval_types=evals_to_run,
-            device=args.device,
-            output_path=str(output_path),
-            llm_batch_size=args.llm_batch_size,
-            llm_dtype=args.llm_dtype,
-            api_key=api_key,
-            force_rerun=args.force_rerun,
-            save_activations=save_activations,
-            random_seed=args.random_seed,
-        )
-    
-    # Merge existing results with new results (new results take precedence)
-    all_results = {**existing_results, **new_results}
-    
-    # Print summary
-    print("\n" + "="*60)
-    print("EVALUATION SUMMARY")
-    print("="*60)
-    for eval_type, result in all_results.items():
-        status = "(NEW)" if eval_type in new_results else "(EXISTING)"
-        print(f"\n{eval_type} {status}:")
-        if isinstance(result, dict):
-            for k, v in result.items():
-                if isinstance(v, (int, float)):
-                    print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
-                elif isinstance(v, torch.Tensor) and v.numel() == 1:
-                    print(f"  {k}: {v.item():.4f}")
-    
-    # Upload merged results to wandb (only if we have new results or force_rerun)
-    if not args.skip_upload and (new_results or args.force_rerun):
-        upload_results_to_wandb(
-            results=all_results,
-            wandb_run=wandb_run,
-            output_path=str(output_path),
-            run_id=run_id,
-            run_name=run_name,
-        )
-    elif not args.skip_upload and not new_results:
-        print("\nNo new results to upload (all evaluations were cached)")
-    
-    print("\n" + "="*60)
-    print("EVALUATION COMPLETE")
-    print("="*60)
-    print(f"Results saved to: {output_path}")
 
 
 if __name__ == "__main__":

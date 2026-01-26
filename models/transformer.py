@@ -389,12 +389,14 @@ class SAETransformer(torch.nn.Module):
                 return tokens
 
     @classmethod
-    def from_wandb(cls, wandb_project_run_id: str) -> "SAETransformer":
-        """Instantiate an SAETransformer using the latest checkpoint from a wandb run.
+    def from_wandb(cls, wandb_project_run_id: str, checkpoint_step: int | None = None) -> "SAETransformer":
+        """Instantiate an SAETransformer using a checkpoint from a wandb run.
 
         Args:
             wandb_project_run_id: The wandb project name and run ID separated by a forward slash.
                 E.g. "gpt2/2lzle2f0"
+            checkpoint_step: Optional step number to load a specific checkpoint (e.g., 30000).
+                If None, loads the latest (highest step) checkpoint.
 
         Returns:
             An instance of the SAETransformer class loaded from the specified wandb run.
@@ -413,15 +415,33 @@ class SAETransformer(torch.nn.Module):
 
         checkpoints = [file for file in run.files() if file.name.endswith(".pt")]
         assert len(checkpoints) > 0, f"Cannot find any checkpoints for wandb run {wandb_project_run_id}."
-        latest_checkpoint_remote = sorted(
+        
+        # Sort checkpoints by step number
+        sorted_checkpoints = sorted(
             checkpoints, key=lambda x: int(x.name.split(".pt")[0].split("_")[-1])
-        )[-1]
-        latest_checkpoint_file = latest_checkpoint_remote.download(
+        )
+        
+        if checkpoint_step is not None:
+            # Find checkpoint matching the specified step
+            matching = [c for c in sorted_checkpoints 
+                       if int(c.name.split(".pt")[0].split("_")[-1]) == checkpoint_step]
+            if not matching:
+                available_steps = [int(c.name.split(".pt")[0].split("_")[-1]) for c in sorted_checkpoints]
+                raise ValueError(
+                    f"Checkpoint step {checkpoint_step} not found. "
+                    f"Available steps: {available_steps}"
+                )
+            checkpoint_remote = matching[0]
+        else:
+            # Use the latest checkpoint (highest step)
+            checkpoint_remote = sorted_checkpoints[-1]
+        
+        checkpoint_file = checkpoint_remote.download(
             exist_ok=True, replace=True, root=model_cache_dir
         ).name
-        assert latest_checkpoint_file is not None, "Failed to download the latest checkpoint."
+        assert checkpoint_file is not None, "Failed to download the checkpoint."
         return cls.from_local_path(
-            checkpoint_file=latest_checkpoint_file, config_file=train_config_file
+            checkpoint_file=checkpoint_file, config_file=train_config_file
         )
 
     @classmethod

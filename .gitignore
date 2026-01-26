@@ -212,3 +212,6 @@ experiment_outputs/
 
 # Wandb artifacts cache (downloaded evaluation data)
 artifacts/
+
+# SAE Bench evaluation results (keep locally, not tracked)
+saebench_results/

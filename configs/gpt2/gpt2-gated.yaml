@@ -44,10 +44,6 @@ saes:
   pretrained_sae_paths: null
   retrain_saes: false
   sae_positions:
-    - blocks.2.hook_resid_pre
-    - blocks.4.hook_resid_pre
-    - blocks.6.hook_resid_pre
     - blocks.8.hook_resid_pre
-    - blocks.10.hook_resid_pre
   init_decoder_orthogonal: true
   sparsity_coeff: 0.1

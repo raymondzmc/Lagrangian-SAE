@@ -1,5 +1,5 @@
 conda activate sae
 
-CUDA_VISIBLE_DEVICES=2 python run_sweep.py \
+CUDA_VISIBLE_DEVICES=0 python run_sweep.py \
 --base_config configs/gemma2-2b/gemma2-gated.yaml \
 --sweep_config configs/gemma2-2b/sweep/65K_gated_sweep.yaml

@@ -29,8 +29,8 @@
     "random_seed": 42,
     "artifact_dir": "artifacts/ravel"
   },
-  "eval_id": "fc94a399-e9ad-4dd7-b6ae-f43dfe02cc83",
-  "datetime_epoch_millis": 1769337014759,
+  "eval_id": "d1aa2951-db26-4e6d-b8a6-c784ce48b58f",
+  "datetime_epoch_millis": 1769393863322,
   "eval_result_metrics": {
     "ravel": {
       "disentanglement_score": 0.3821852394873774,
@@ -39,7 +39,7 @@
     }
   },
   "eval_result_details": [],
-  "sae_bench_commit_hash": "49a408278084c854a29b369c4c9950f9d954c00e",
+  "sae_bench_commit_hash": "a62015fa6d4f4e93e25cfeaafc350eef7b2ab273",
   "sae_lens_id": "custom_sae",
   "sae_lens_release_id": "google/gemma-2-2b_blocks.12.hook_resid_pre_topk",
   "sae_lens_version": "6.30.0",

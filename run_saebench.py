@@ -19,6 +19,7 @@ Usage:
 import os
 import sys
 import json
+import glob
 import argparse
 from pathlib import Path
 
@@ -118,6 +119,108 @@ OUTPUT_FOLDERS = {
     "sparse_probing_sae_probes": "eval_results/sparse_probing_sae_probes",
     "ravel": "eval_results/ravel",
 }
+
+# All known evaluation types
+ALL_EVAL_TYPES = ["core", "autointerp", "scr", "tpp", "ravel", "sparse_probing", "sparse_probing_sae_probes", "absorption"]
+
+
+def download_existing_results(
+    run_name: str,
+    output_path: str,
+    entity: str,
+    project: str,
+) -> dict[str, dict]:
+    """
+    Download existing SAEBench results from wandb artifact if available.
+    
+    Args:
+        run_name: The wandb run name (used as artifact name)
+        output_path: Local path to download results to
+        entity: Wandb entity
+        project: Wandb project name
+        
+    Returns:
+        Dictionary of existing results keyed by eval type, empty dict if no artifact exists
+    """
+    api = wandb.Api()
+    artifact_path = f"{entity}/{project}/{run_name}:latest"
+    
+    try:
+        print(f"Checking for existing artifact: {artifact_path}")
+        artifact = api.artifact(artifact_path, type="saebench-results")
+        print(f"Found existing artifact: {artifact.name} (version {artifact.version})")
+        
+        # Download artifact to output path
+        artifact_dir = artifact.download(root=output_path)
+        print(f"Downloaded artifact to: {artifact_dir}")
+        
+        # Load results from downloaded files
+        results = {}
+        for eval_type in ALL_EVAL_TYPES:
+            result_file = os.path.join(output_path, f"{eval_type}_results.json")
+            if os.path.exists(result_file):
+                try:
+                    with open(result_file) as f:
+                        results[eval_type] = json.load(f)
+                    print(f"  Loaded existing results for: {eval_type}")
+                except json.JSONDecodeError:
+                    print(f"  Warning: Could not parse {eval_type}_results.json")
+        
+        return results
+        
+    except wandb.errors.CommError as e:
+        print(f"No existing artifact found: {e}")
+        return {}
+    except Exception as e:
+        print(f"Error downloading artifact: {e}")
+        return {}
+
+
+def get_missing_evals(
+    requested_evals: list[str],
+    existing_results: dict[str, dict],
+    output_path: str,
+) -> list[str]:
+    """
+    Determine which evaluations need to run based on existing results.
+    
+    An evaluation is considered missing if:
+    - It's not in existing_results, OR
+    - Its detailed results directory is empty (no JSON files)
+    
+    Args:
+        requested_evals: List of eval types the user requested
+        existing_results: Dict of existing results from wandb/local
+        output_path: Local output path to check for detailed results
+        
+    Returns:
+        List of eval types that need to be run
+    """
+    missing = []
+    
+    for eval_type in requested_evals:
+        # Check if we have summary results
+        has_summary = eval_type in existing_results and existing_results[eval_type]
+        
+        # Check if we have detailed results in the subdirectory
+        eval_dir = os.path.join(output_path, eval_type)
+        has_detailed = False
+        if os.path.isdir(eval_dir):
+            json_files = glob.glob(os.path.join(eval_dir, "*.json"))
+            has_detailed = len(json_files) > 0
+        
+        if not has_summary or not has_detailed:
+            missing.append(eval_type)
+            reason = []
+            if not has_summary:
+                reason.append("no summary results")
+            if not has_detailed:
+                reason.append("no detailed results")
+            print(f"  {eval_type}: NEEDS RUN ({', '.join(reason)})")
+        else:
+            print(f"  {eval_type}: EXISTS (skipping)")
+    
+    return missing
 
 
 def get_model_config(model_name: str) -> dict:
@@ -497,8 +600,13 @@ def run_evaluations(
         # Get the hook name from the first SAE
         hook_name = selected_saes[0][1].cfg.hook_name if selected_saes else None
         
+        # Convert full HuggingFace path to short name (sae-probes expects TransformerLens names)
+        sae_probes_model_name = model_name
+        if "/" in model_name:
+            sae_probes_model_name = model_name.split("/")[-1]
+        
         config = sparse_probing_sae_probes.SparseProbingSaeProbesEvalConfig(
-            model_name=model_name,
+            model_name=sae_probes_model_name,
             ks=[1, 2, 5, 10],  # k values for sparse probing
             include_llm_baseline=True,  # Compare against LLM residual stream baseline
             results_path=os.path.join(output_path, "artifacts/sparse_probing_sae_probes"),
@@ -791,11 +899,19 @@ def main():
     if args.run_name:
         if not args.project:
             raise ValueError("--project is required when using --run_name")
-        entity = args.entity  # Will use settings.wandb_entity if None
-        wandb_run = find_run_by_name(args.project, args.run_name, entity)
+        entity = args.entity or settings.wandb_entity
+        project = args.project
+        wandb_run = find_run_by_name(project, args.run_name, entity)
         run_name = args.run_name
     elif args.wandb_run:
         wandb_run = args.wandb_run
+        # Parse entity and project from wandb_run path
+        parts = wandb_run.split("/")
+        if len(parts) == 3:
+            entity, project, _ = parts
+        else:
+            entity = settings.wandb_entity
+            project = parts[0] if len(parts) >= 1 else None
         # Fetch run name from wandb API
         api = wandb.Api()
         run = api.run(wandb_run)
@@ -842,30 +958,69 @@ def main():
     for sae_id, sae in selected_saes:
         print(f"  - {sae_id}: d_in={sae.cfg.d_in}, d_sae={sae.cfg.d_sae}")
     
-    # Run evaluations
     # Determine whether to save activations (default True, unless --no_save_activations)
     save_activations = not args.no_save_activations
     
-    results = run_evaluations(
-        selected_saes=selected_saes,
-        model_name=model_name,
-        eval_types=args.eval_types,
-        device=args.device,
-        output_path=str(output_path),
-        llm_batch_size=args.llm_batch_size,
-        llm_dtype=args.llm_dtype,
-        api_key=api_key,
-        force_rerun=args.force_rerun,
-        save_activations=save_activations,
-        random_seed=args.random_seed,
-    )
+    # Smart re-run logic: check for existing results and only run missing evals
+    existing_results = {}
+    evals_to_run = args.eval_types
+    
+    if not args.force_rerun:
+        print("\n" + "="*60)
+        print("CHECKING FOR EXISTING RESULTS")
+        print("="*60)
+        
+        # Try to download existing results from wandb artifact
+        existing_results = download_existing_results(
+            run_name=run_name,
+            output_path=str(output_path),
+            entity=entity,
+            project=project,
+        )
+        
+        # Determine which evals need to run
+        print("\nDetermining which evaluations need to run:")
+        evals_to_run = get_missing_evals(
+            requested_evals=args.eval_types,
+            existing_results=existing_results,
+            output_path=str(output_path),
+        )
+        
+        if not evals_to_run:
+            print("\nAll requested evaluations already have results!")
+            print("Use --force_rerun to re-run anyway.")
+        else:
+            print(f"\nWill run {len(evals_to_run)} evaluation(s): {', '.join(evals_to_run)}")
+    else:
+        print("\n--force_rerun specified, will run all requested evaluations")
+    
+    # Run evaluations (only the ones that need to run)
+    new_results = {}
+    if evals_to_run:
+        new_results = run_evaluations(
+            selected_saes=selected_saes,
+            model_name=model_name,
+            eval_types=evals_to_run,
+            device=args.device,
+            output_path=str(output_path),
+            llm_batch_size=args.llm_batch_size,
+            llm_dtype=args.llm_dtype,
+            api_key=api_key,
+            force_rerun=args.force_rerun,
+            save_activations=save_activations,
+            random_seed=args.random_seed,
+        )
+    
+    # Merge existing results with new results (new results take precedence)
+    all_results = {**existing_results, **new_results}
     
     # Print summary
     print("\n" + "="*60)
     print("EVALUATION SUMMARY")
     print("="*60)
-    for eval_type, result in results.items():
-        print(f"\n{eval_type}:")
+    for eval_type, result in all_results.items():
+        status = "(NEW)" if eval_type in new_results else "(EXISTING)"
+        print(f"\n{eval_type} {status}:")
         if isinstance(result, dict):
             for k, v in result.items():
                 if isinstance(v, (int, float)):
@@ -873,15 +1028,17 @@ def main():
                 elif isinstance(v, torch.Tensor) and v.numel() == 1:
                     print(f"  {k}: {v.item():.4f}")
     
-    # Upload results to wandb
-    if not args.skip_upload:
+    # Upload merged results to wandb (only if we have new results or force_rerun)
+    if not args.skip_upload and (new_results or args.force_rerun):
         upload_results_to_wandb(
-            results=results,
+            results=all_results,
             wandb_run=wandb_run,
             output_path=str(output_path),
             run_id=run_id,
             run_name=run_name,
         )
+    elif not args.skip_upload and not new_results:
+        print("\nNo new results to upload (all evaluations were cached)")
     
     print("\n" + "="*60)
     print("EVALUATION COMPLETE")

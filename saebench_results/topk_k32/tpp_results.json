@@ -70,8 +70,8 @@
         ]
       }
     },
-    "eval_id": "a0f00758-1ba4-4dc9-8d1d-15b333dccacc",
-    "datetime_epoch_millis": 1769329184799,
+    "eval_id": "18ecc8df-da6a-4931-8bcf-3bc6aaa93c5e",
+    "datetime_epoch_millis": 1769390303258,
     "eval_result_metrics": {
       "tpp_metrics": {
         "tpp_threshold_2_total_metric": 0.005725003778934479,
@@ -147,7 +147,7 @@
         "tpp_threshold_500_unintended_diff_only": 0.016700005531311034
       }
     ],
-    "sae_bench_commit_hash": "49a408278084c854a29b369c4c9950f9d954c00e",
+    "sae_bench_commit_hash": "a62015fa6d4f4e93e25cfeaafc350eef7b2ab273",
     "sae_lens_id": "custom_sae",
     "sae_lens_release_id": "google/gemma-2-2b_blocks.12.hook_resid_pre_topk",
     "sae_lens_version": "6.30.0",

@@ -1,0 +1,109 @@
+{
+  "google/gemma-2-2b_blocks.12.hook_resid_pre_lagrangian_custom_sae": {
+    "eval_type_id": "ravel",
+    "eval_config": {
+      "entity_attribute_selection": {
+        "city": [
+          "Country",
+          "Continent",
+          "Language"
+        ],
+        "nobel_prize_winner": [
+          "Country of Birth",
+          "Field",
+          "Gender"
+        ]
+      },
+      "top_n_entities": 500,
+      "top_n_templates": 90,
+      "full_dataset_downsample": null,
+      "num_pairs_per_attribute": 5000,
+      "train_test_split": 0.7,
+      "force_dataset_recompute": false,
+      "model_name": "google/gemma-2-2b",
+      "llm_dtype": "bfloat16",
+      "llm_batch_size": 4,
+      "learning_rate": 0.001,
+      "num_epochs": 2,
+      "train_mdas": false,
+      "n_generated_tokens": 6,
+      "random_seed": 42,
+      "artifact_dir": "artifacts/ravel"
+    },
+    "eval_id": "0722071f-3509-4acf-b0f1-70830dd8ec00",
+    "datetime_epoch_millis": 1769404647176,
+    "eval_result_metrics": {
+      "ravel": {
+        "disentanglement_score": 0.4892288333717576,
+        "cause_score": 0.0035844232737588582,
+        "isolation_score": 0.9748732434697563
+      }
+    },
+    "eval_result_details": [],
+    "sae_bench_commit_hash": "bcb8cfe0e327661851a33dcd1db5ff709206b410",
+    "sae_lens_id": "custom_sae",
+    "sae_lens_release_id": "google/gemma-2-2b_blocks.12.hook_resid_pre_lagrangian",
+    "sae_lens_version": "6.30.0",
+    "sae_cfg_dict": {
+      "model_name": "google/gemma-2-2b",
+      "d_in": 2304,
+      "d_sae": 65536,
+      "hook_layer": 12,
+      "hook_name": "blocks.12.hook_resid_pre",
+      "context_size": null,
+      "hook_head_index": null,
+      "architecture": "lagrangian_sae_lagrangian",
+      "apply_b_dec_to_input": null,
+      "finetuning_scaling_factor": null,
+      "activation_fn_str": "",
+      "prepend_bos": true,
+      "normalize_activations": "none",
+      "dtype": "bfloat16",
+      "device": "",
+      "dataset_path": "",
+      "dataset_trust_remote_code": true,
+      "seqpos_slice": [
+        null
+      ],
+      "training_tokens": 512000000,
+      "sae_lens_training_version": null,
+      "neuronpedia_id": null
+    },
+    "eval_result_unstructured": {
+      "city_results": {
+        "city_Country": {
+          "cause_score": 0.0,
+          "isolation_score": 0.9859906604402935,
+          "disentangle_score": 0.49299533022014674
+        },
+        "city_Continent": {
+          "cause_score": 0.001941747572815534,
+          "isolation_score": 0.99106529209622,
+          "disentangle_score": 0.49650351983451774
+        },
+        "city_Language": {
+          "cause_score": 0.0,
+          "isolation_score": 0.9946488294314382,
+          "disentangle_score": 0.4973244147157191
+        }
+      },
+      "nobel_prize_winner_results": {
+        "nobel_prize_winner_Country of Birth": {
+          "cause_score": 0.012738853503184714,
+          "isolation_score": 0.9521109010712036,
+          "disentangle_score": 0.48242487728719413
+        },
+        "nobel_prize_winner_Field": {
+          "cause_score": 0.006825938566552901,
+          "isolation_score": 0.971986970684039,
+          "disentangle_score": 0.489406454625296
+        },
+        "nobel_prize_winner_Gender": {
+          "cause_score": 0.0,
+          "isolation_score": 0.9534368070953437,
+          "disentangle_score": 0.47671840354767187
+        }
+      }
+    }
+  }
+}

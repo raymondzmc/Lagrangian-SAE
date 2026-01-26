@@ -1,6 +1,4 @@
 wandb_project: "gemma2-2b-65K"
-target_l0: [32, 64, 128, 256]
-alpha_max: [10]
-alpha_min: [1]
-equality_constraint: [true]
+target_l0: [256]
+alpha_max: [5]
 n_dict_components: 65536

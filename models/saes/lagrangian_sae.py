@@ -489,6 +489,10 @@ class LagrangianSAE(BaseSAE):
         # Compute mean L0 across the batch (true L0 for monitoring)
         mean_l0 = output.l0.mean()
         
+        # DEBUG: Check if compute_loss is called in eval mode
+        if not self.training:
+            print(f"DEBUG: compute_loss called with self.training=False!")
+        
         # Update running L0 (EMA) for stable constraint evaluation
         if self.training:
             with torch.no_grad():
@@ -497,11 +501,22 @@ class LagrangianSAE(BaseSAE):
                 # updates can get lost due to limited mantissa bits (e.g., 74.5 is a "sticky"
                 # value in bfloat16 where small updates round back to the same value)
                 running_l0_f32 = self.running_l0.float()
+                old_value = running_l0_f32.item()  # DEBUG
                 running_l0_f32 = (
                     self.l0_ema_momentum * running_l0_f32
                     + (1.0 - self.l0_ema_momentum) * mean_l0.detach().float()
                 )
                 self.running_l0.copy_(running_l0_f32)
+                new_value = self.running_l0.item()  # DEBUG
+                expected_delta = (1.0 - self.l0_ema_momentum) * (mean_l0.item() - old_value)  # DEBUG
+                actual_delta = new_value - old_value  # DEBUG
+                # DEBUG: Print every 100th update and flag when update is unexpectedly small
+                if not hasattr(self, '_debug_counter'):
+                    self._debug_counter = 0
+                self._debug_counter += 1
+                if self._debug_counter % 100 == 1 or abs(actual_delta) < abs(expected_delta) * 0.1:
+                    print(f"DEBUG EMA [{self._debug_counter}]: old={old_value:.4f}, l0={mean_l0.item():.4f}, new={new_value:.4f}, "
+                          f"actual_delta={actual_delta:.6f}, expected_delta={expected_delta:.6f}")
         
         # Use RUNNING L0 for dual ascent (smoother updates)
         running_constraint_violation = self.running_l0 - self.target_l0
